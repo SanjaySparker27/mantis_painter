@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+
+# YOLO weights — auto-downloaded by ultralytics on first run
+yolo12n.pt
+yolo11n.pt
+yolov8n.pt
+yolov5*.pt
+
+# Runtime artefacts
+output/
+/tmp/mantis_*.log
+/tmp/mantis_paint.signal
+
+# Editor swap
+*.swp

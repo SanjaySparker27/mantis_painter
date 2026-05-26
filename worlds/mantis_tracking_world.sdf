@@ -1,0 +1,251 @@
+<?xml version="1.0" ?>
+<sdf version="1.10">
+  <world name="mantis_tracking_world">
+    <physics name="1ms" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <gui fullscreen="0">
+      <plugin filename="MinimalScene" name="3D View">
+        <gz-gui>
+          <title>3D View</title>
+          <property type="bool" key="showTitleBar">false</property>
+          <property type="string" key="state">docked</property>
+        </gz-gui>
+        <engine>ogre2</engine>
+        <scene>scene</scene>
+        <ambient_light>0.85 0.85 0.85</ambient_light>
+        <background_color>0.78 0.82 0.86</background_color>
+        <camera_pose>-7 -17 6.2 0 0.42 0.38</camera_pose>
+      </plugin>
+      <plugin filename="EntityContextMenuPlugin" name="Entity context menu">
+        <gz-gui>
+          <property key="state" type="string">floating</property>
+          <property key="width" type="double">5</property>
+          <property key="height" type="double">5</property>
+          <property key="showTitleBar" type="bool">false</property>
+        </gz-gui>
+      </plugin>
+      <plugin filename="GzSceneManager" name="Scene Manager">
+        <gz-gui>
+          <property key="resizable" type="bool">false</property>
+          <property key="width" type="double">5</property>
+          <property key="height" type="double">5</property>
+          <property key="state" type="string">floating</property>
+          <property key="showTitleBar" type="bool">false</property>
+        </gz-gui>
+      </plugin>
+      <plugin filename="InteractiveViewControl" name="Interactive view control">
+        <gz-gui>
+          <property key="resizable" type="bool">false</property>
+          <property key="width" type="double">5</property>
+          <property key="height" type="double">5</property>
+          <property key="state" type="string">floating</property>
+          <property key="showTitleBar" type="bool">false</property>
+        </gz-gui>
+      </plugin>
+      <plugin filename="CameraTracking" name="Camera Tracking">
+        <gz-gui>
+          <property key="resizable" type="bool">false</property>
+          <property key="width" type="double">5</property>
+          <property key="height" type="double">5</property>
+          <property key="state" type="string">floating</property>
+          <property key="showTitleBar" type="bool">false</property>
+        </gz-gui>
+      </plugin>
+      <plugin filename="ImageDisplay" name="MANTIS Nose Camera">
+        <topic>/mantis/nose_camera/image</topic>
+        <gz-gui>
+          <title>MANTIS Nose Camera</title>
+          <property key="state" type="string">docked</property>
+          <property type="double" key="height">360</property>
+          <property type="double" key="width">640</property>
+        </gz-gui>
+      </plugin>
+      <plugin filename="WorldControl" name="World control">
+        <gz-gui>
+          <property type="bool" key="showTitleBar">false</property>
+          <property type="string" key="state">floating</property>
+        </gz-gui>
+        <play_pause>true</play_pause>
+        <step>true</step>
+        <start_paused>false</start_paused>
+      </plugin>
+      <plugin filename="WorldStats" name="World stats"/>
+      <plugin filename="EntityTree" name="Entity tree"/>
+    </gui>
+
+    <light type="directional" name="sun">
+      <pose>0 0 30 0 0 0</pose>
+      <diffuse>0.85 0.85 0.82 1</diffuse>
+      <specular>0.25 0.25 0.25 1</specular>
+      <direction>-0.4 0.25 -0.88</direction>
+    </light>
+
+    <model name="road">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>80 34 0.04</size></box></geometry>
+        </collision>
+        <visual name="asphalt">
+          <geometry><box><size>80 34 0.04</size></box></geometry>
+          <material><ambient>0.22 0.22 0.22 1</ambient><diffuse>0.28 0.28 0.28 1</diffuse></material>
+        </visual>
+        <visual name="lane_1">
+          <pose>10 0 0.035 0 0 0</pose>
+          <geometry><box><size>18 0.12 0.012</size></box></geometry>
+          <material><ambient>0.95 0.84 0.18 1</ambient><diffuse>0.95 0.84 0.18 1</diffuse></material>
+        </visual>
+        <visual name="lane_2">
+          <pose>-18 0 0.035 0 0 0</pose>
+          <geometry><box><size>18 0.12 0.012</size></box></geometry>
+          <material><ambient>0.95 0.84 0.18 1</ambient><diffuse>0.95 0.84 0.18 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="mantis">
+      <pose>0 -11 0.08 0 0 0</pose>
+
+      <link name="base_link">
+        <inertial><mass>80</mass><inertia><ixx>30</ixx><iyy>30</iyy><izz>30</izz></inertia></inertial>
+        <collision name="base_collision">
+          <geometry><box><size>4.8 3.6 0.28</size></box></geometry>
+        </collision>
+        <visual name="base_visual">
+          <geometry><box><size>4.8 3.6 0.28</size></box></geometry>
+          <material><ambient>0.16 0.18 0.20 1</ambient><diffuse>0.22 0.25 0.28 1</diffuse></material>
+        </visual>
+      </link>
+
+      <link name="pan_link">
+        <pose>0 0 0.48 0 0 0</pose>
+        <inertial><mass>35</mass><inertia><ixx>12</ixx><iyy>12</iyy><izz>12</izz></inertia></inertial>
+        <visual name="mantis_stl_reference">
+          <pose>-0.35 0.6 -0.18 0 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>file:///home/sanju/MANTIS_PAINTER/models/mantis/meshes/MANTIS.stl</uri>
+              <scale>0.34 0.34 0.34</scale>
+            </mesh>
+          </geometry>
+          <material><ambient>0.18 0.20 0.23 1</ambient><diffuse>0.26 0.29 0.33 1</diffuse></material>
+        </visual>
+        <collision name="body_collision">
+          <pose>0.1 0 0.34 0 0 0</pose>
+          <geometry><box><size>2.8 2.0 0.9</size></box></geometry>
+        </collision>
+      </link>
+
+      <joint name="pan_joint" type="revolute">
+        <parent>base_link</parent>
+        <child>pan_link</child>
+        <axis>
+          <xyz>0 0 1</xyz>
+          <limit><lower>-1.5708</lower><upper>1.5708</upper><effort>500</effort><velocity>1.2</velocity></limit>
+        </axis>
+      </joint>
+
+      <link name="tilt_link">
+        <pose>2.0 0 0.86 0 0 0</pose>
+        <inertial><mass>9</mass><inertia><ixx>2</ixx><iyy>2</iyy><izz>2</izz></inertia></inertial>
+        <visual name="nose_visual">
+          <pose>0.72 0 0 0 1.5708 0</pose>
+          <geometry><box><size>0.32 0.42 1.65</size></box></geometry>
+          <material><ambient>0.42 0.45 0.48 1</ambient><diffuse>0.55 0.58 0.62 1</diffuse></material>
+        </visual>
+        <visual name="camera_marker">
+          <pose>1.52 0 0.24 0 0 0</pose>
+          <geometry><box><size>0.18 0.18 0.12</size></box></geometry>
+          <material><ambient>0.0 0.45 0.55 1</ambient><diffuse>0.0 0.65 0.75 1</diffuse></material>
+        </visual>
+        <sensor name="nose_camera" type="camera">
+          <pose>1.58 0 0.25 0 0 0</pose>
+          <topic>/mantis/nose_camera/image</topic>
+          <update_rate>30</update_rate>
+          <camera>
+            <horizontal_fov>1.012</horizontal_fov>
+            <image><width>1280</width><height>720</height><format>R8G8B8</format></image>
+            <clip><near>0.1</near><far>120</far></clip>
+          </camera>
+        </sensor>
+      </link>
+
+      <joint name="tilt_joint" type="revolute">
+        <parent>pan_link</parent>
+        <child>tilt_link</child>
+        <pose>1.45 0 0.86 0 0 0</pose>
+        <axis>
+          <xyz>0 1 0</xyz>
+          <limit><lower>-0.4363</lower><upper>0.7854</upper><effort>180</effort><velocity>1.0</velocity></limit>
+        </axis>
+      </joint>
+
+      <plugin filename="gz-sim-joint-position-controller-system" name="gz::sim::systems::JointPositionController">
+        <joint_name>pan_joint</joint_name>
+        <topic>/mantis/pan_cmd</topic>
+        <p_gain>8.0</p_gain>
+      </plugin>
+      <plugin filename="gz-sim-joint-position-controller-system" name="gz::sim::systems::JointPositionController">
+        <joint_name>tilt_joint</joint_name>
+        <topic>/mantis/tilt_cmd</topic>
+        <p_gain>7.0</p_gain>
+      </plugin>
+    </model>
+
+    <include>
+      <name>car_prius_front</name>
+      <pose>18 -1 0.03 0 0 1.5708</pose>
+      <uri>/home/sanju/.gz/fuel/fuel.gazebosim.org/openrobotics/models/prius%20hybrid/3</uri>
+    </include>
+    <include>
+      <name>car_pickup_front</name>
+      <pose>28 5 0.02 0 0 1.5708</pose>
+      <uri>/home/sanju/.gz/fuel/fuel.gazebosim.org/openrobotics/models/pickup/4</uri>
+    </include>
+    <include>
+      <name>car_prius_far</name>
+      <pose>38 -6 0.03 0 0 1.5708</pose>
+      <uri>/home/sanju/.gz/fuel/fuel.gazebosim.org/openrobotics/models/prius%20hybrid/3</uri>
+    </include>
+
+    <model name="bright_car_marker_front">
+      <static>true</static>
+      <pose>18 -1 0.8 0 0 0</pose>
+      <link name="link">
+        <visual name="body">
+          <geometry><box><size>4.6 2.0 1.4</size></box></geometry>
+          <material><ambient>0.9 0.12 0.08 1</ambient><diffuse>0.9 0.12 0.08 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+    <model name="bright_car_marker_right">
+      <static>true</static>
+      <pose>28 5 0.9 0 0 0</pose>
+      <link name="link">
+        <visual name="body">
+          <geometry><box><size>5.2 2.2 1.6</size></box></geometry>
+          <material><ambient>0.1 0.55 0.95 1</ambient><diffuse>0.1 0.55 0.95 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+    <model name="bright_car_marker_far">
+      <static>true</static>
+      <pose>38 -6 0.8 0 0 0</pose>
+      <link name="link">
+        <visual name="body">
+          <geometry><box><size>4.6 2.0 1.4</size></box></geometry>
+          <material><ambient>0.1 0.75 0.25 1</ambient><diffuse>0.1 0.75 0.25 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+  </world>
+</sdf>

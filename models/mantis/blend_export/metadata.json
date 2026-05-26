@@ -1,0 +1,37 @@
+{
+  "source": "/home/sanju/Documents/BLENDER/MANTIS.blend",
+  "asset": "/assets/mantis/mantis_rig.glb",
+  "objects": {
+    "base": "BAREL_standardSurface1_0",
+    "pan": "BAREL_standardSurface1_0.001",
+    "tilt": "BAREL_standardSurface1_0.002"
+  },
+  "limits": {
+    "pan": {
+      "name": "Limit Rotation",
+      "owner_space": "WORLD",
+      "use_limit_x": false,
+      "use_limit_y": false,
+      "use_limit_z": true,
+      "min_x_deg": 0.0,
+      "max_x_deg": 0.0,
+      "min_y_deg": 0.0,
+      "max_y_deg": 0.0,
+      "min_z_deg": -85.29999907243065,
+      "max_z_deg": 89.19999610737291
+    },
+    "tilt": {
+      "name": "Limit Rotation",
+      "owner_space": "WORLD",
+      "use_limit_x": false,
+      "use_limit_y": true,
+      "use_limit_z": false,
+      "min_x_deg": 0.0,
+      "max_x_deg": 0.0,
+      "min_y_deg": -39.99999883637168,
+      "max_y_deg": 30.000000834826057,
+      "min_z_deg": 0.0,
+      "max_z_deg": 0.0
+    }
+  }
+}

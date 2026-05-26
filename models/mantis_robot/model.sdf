@@ -1,0 +1,119 @@
+<?xml version="1.0" ?>
+<sdf version="1.10">
+  <model name="mantis_robot">
+    <joint name="world_fix" type="fixed">
+      <parent>world</parent>
+      <child>base_link</child>
+    </joint>
+
+    <link name="base_link">
+      <pose>0.000000 0.000000 0.000000 0 0 0</pose>
+      <inertial><mass>80</mass><inertia><ixx>45</ixx><iyy>45</iyy><izz>45</izz></inertia></inertial>
+      <collision name="base_collision">
+        <pose>0.9 -2.37 0.65 0 0 0</pose>
+        <geometry><box><size>9.4 9.4 1.4</size></box></geometry>
+      </collision>
+      <visual name="base_visual">
+        <geometry><mesh><uri>meshes/base_link.stl</uri></mesh></geometry>
+        <material><ambient>0.18 0.20 0.22 1</ambient><diffuse>0.26 0.29 0.32 1</diffuse></material>
+      </visual>
+    </link>
+
+    <link name="pan_link">
+      <pose>2.259159 -2.233988 2.039962 0 0 0</pose>
+      <inertial><mass>40</mass><inertia><ixx>60</ixx><iyy>60</iyy><izz>60</izz></inertia></inertial>
+      <collision name="pan_collision">
+        <pose>0 0 1.1 0 0 0</pose>
+        <geometry><box><size>8.2 6.2 2.8</size></box></geometry>
+      </collision>
+      <visual name="pan_visual">
+        <geometry><mesh><uri>meshes/pan_link.stl</uri></mesh></geometry>
+        <material><ambient>0.08 0.10 0.12 1</ambient><diffuse>0.12 0.15 0.18 1</diffuse></material>
+      </visual>
+    </link>
+
+    <joint name="pan_joint" type="revolute">
+      <parent>base_link</parent>
+      <child>pan_link</child>
+      <pose relative_to="base_link">2.259159 -2.233988 2.039962 0 0 0</pose>
+      <axis>
+        <xyz expressed_in="base_link">0 0 1</xyz>
+        <limit><lower>-1.48876584</lower><upper>1.55683362</upper><effort>3000</effort><velocity>2.5</velocity></limit>
+        <dynamics><damping>120.0</damping><friction>8.0</friction></dynamics>
+      </axis>
+    </joint>
+
+    <link name="tilt_link">
+      <pose>3.998708 -2.146332 3.529934 0 0 0</pose>
+      <inertial>
+        <pose>3.0 0 0.6 0 0 0</pose>
+        <mass>12</mass>
+        <inertia><ixx>15</ixx><iyy>30</iyy><izz>30</izz></inertia>
+      </inertial>
+      <collision name="tilt_collision">
+        <pose>3.0 0 0.6 0 0 0</pose>
+        <geometry><box><size>6.4 1.8 1.8</size></box></geometry>
+      </collision>
+      <visual name="tilt_visual">
+        <geometry><mesh><uri>meshes/tilt_link.stl</uri></mesh></geometry>
+        <material><ambient>0.45 0.48 0.52 1</ambient><diffuse>0.60 0.63 0.68 1</diffuse></material>
+      </visual>
+      <visual name="nose_camera_marker">
+        <pose>6.250000 0.000000 1.650000 0 0 0</pose>
+        <geometry><box><size>0.28 0.22 0.18</size></box></geometry>
+        <material><ambient>0.0 0.55 0.65 1</ambient><diffuse>0.0 0.8 0.9 1</diffuse></material>
+      </visual>
+      <sensor name="nose_camera" type="camera">
+        <pose>6.250000 0.000000 1.650000 0 0 0</pose>
+        <topic>/mantis/nose_camera/image</topic>
+        <update_rate>30</update_rate>
+        <camera>
+          <horizontal_fov>1.012</horizontal_fov>
+          <image><width>1280</width><height>720</height><format>R8G8B8</format></image>
+          <clip><near>0.1</near><far>160</far></clip>
+        </camera>
+      </sensor>
+    </link>
+
+    <joint name="tilt_joint" type="revolute">
+      <parent>pan_link</parent>
+      <child>tilt_link</child>
+      <pose relative_to="pan_link">1.739549 0.087656 1.489971 0 0 0</pose>
+      <axis>
+        <xyz expressed_in="pan_link">0 1 0</xyz>
+        <limit><lower>-0.69813168</lower><upper>0.52359879</upper><effort>2500</effort><velocity>2.0</velocity></limit>
+        <dynamics><damping>90.0</damping><friction>6.0</friction></dynamics>
+      </axis>
+    </joint>
+
+    <plugin filename="gz-sim-joint-position-controller-system" name="gz::sim::systems::JointPositionController">
+      <joint_name>pan_joint</joint_name>
+      <topic>/mantis/pan_cmd</topic>
+      <p_gain>2000.0</p_gain>
+      <i_gain>60.0</i_gain>
+      <d_gain>900.0</d_gain>
+      <i_max>500.0</i_max>
+      <i_min>-500.0</i_min>
+      <cmd_max>3000.0</cmd_max>
+      <cmd_min>-3000.0</cmd_min>
+      <initial_position>0.0</initial_position>
+    </plugin>
+    <plugin filename="gz-sim-joint-position-controller-system" name="gz::sim::systems::JointPositionController">
+      <joint_name>tilt_joint</joint_name>
+      <topic>/mantis/tilt_cmd</topic>
+      <p_gain>1750.0</p_gain>
+      <i_gain>50.0</i_gain>
+      <d_gain>900.0</d_gain>
+      <i_max>400.0</i_max>
+      <i_min>-400.0</i_min>
+      <cmd_max>2500.0</cmd_max>
+      <cmd_min>-2500.0</cmd_min>
+      <initial_position>0.20943951</initial_position>
+    </plugin>
+    <plugin filename="gz-sim-joint-state-publisher-system" name="gz::sim::systems::JointStatePublisher">
+      <topic>/mantis/joint_states</topic>
+      <joint_name>pan_joint</joint_name>
+      <joint_name>tilt_joint</joint_name>
+    </plugin>
+  </model>
+</sdf>

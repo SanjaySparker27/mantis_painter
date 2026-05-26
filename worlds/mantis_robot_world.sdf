@@ -1,0 +1,218 @@
+<?xml version="1.0" ?>
+<sdf version="1.10">
+  <world name="mantis_robot_world">
+    <physics name="1ms" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <gui fullscreen="0">
+      <plugin filename="MinimalScene" name="3D View">
+        <gz-gui>
+          <title>3D View</title>
+          <property type="bool" key="showTitleBar">false</property>
+          <property type="string" key="state">docked</property>
+        </gz-gui>
+        <engine>ogre2</engine>
+        <scene>scene</scene>
+        <ambient_light>0.8 0.8 0.8</ambient_light>
+        <background_color>0.72 0.76 0.80</background_color>
+        <camera_pose>2 -15 8 0 0.52 0.1</camera_pose>
+      </plugin>
+      <plugin filename="EntityContextMenuPlugin" name="Entity context menu"/>
+      <plugin filename="GzSceneManager" name="Scene Manager"/>
+      <plugin filename="InteractiveViewControl" name="Interactive view control"/>
+      <plugin filename="CameraTracking" name="Camera Tracking"/>
+      <plugin filename="ImageDisplay" name="MANTIS Nose Camera">
+        <topic>/mantis/nose_camera/image</topic>
+        <gz-gui>
+          <title>MANTIS Nose Camera</title>
+          <property key="state" type="string">docked</property>
+          <property type="double" key="height">360</property>
+          <property type="double" key="width">640</property>
+        </gz-gui>
+      </plugin>
+      <plugin filename="WorldControl" name="World control">
+        <play_pause>true</play_pause>
+        <step>true</step>
+        <start_paused>false</start_paused>
+      </plugin>
+      <plugin filename="WorldStats" name="World stats"/>
+      <plugin filename="EntityTree" name="Entity tree"/>
+    </gui>
+
+    <light type="directional" name="sun">
+      <pose>0 0 30 0 0 0</pose>
+      <diffuse>0.9 0.9 0.86 1</diffuse>
+      <specular>0.25 0.25 0.25 1</specular>
+      <direction>-0.45 0.2 -0.86</direction>
+    </light>
+
+    <model name="road">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>90 38 0.04</size></box></geometry></collision>
+        <visual name="asphalt">
+          <geometry><box><size>90 38 0.04</size></box></geometry>
+          <material><ambient>0.22 0.22 0.22 1</ambient><diffuse>0.28 0.28 0.28 1</diffuse></material>
+        </visual>
+        <visual name="lane_1">
+          <pose>14 -2 0.035 0 0 0</pose>
+          <geometry><box><size>22 0.12 0.012</size></box></geometry>
+          <material><ambient>0.95 0.84 0.18 1</ambient><diffuse>0.95 0.84 0.18 1</diffuse></material>
+        </visual>
+        <visual name="lane_2">
+          <pose>42 -2 0.035 0 0 0</pose>
+          <geometry><box><size>22 0.12 0.012</size></box></geometry>
+          <material><ambient>0.95 0.84 0.18 1</ambient><diffuse>0.95 0.84 0.18 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <include>
+      <name>mantis_robot</name>
+      <pose>0 -8 0.0 0 0 0</pose>
+      <uri>/home/sanju/MANTIS_PAINTER/models/mantis_robot</uri>
+    </include>
+
+    <include>
+      <name>car_prius_front</name>
+      <pose>24 -2 0.03 0 0 1.5708</pose>
+      <uri>/home/sanju/.gz/fuel/fuel.gazebosim.org/openrobotics/models/prius%20hybrid/3</uri>
+    </include>
+    <include>
+      <name>car_pickup_right</name>
+      <pose>34 5 0.02 0 0 1.5708</pose>
+      <uri>/home/sanju/.gz/fuel/fuel.gazebosim.org/openrobotics/models/pickup/4</uri>
+    </include>
+
+    <model name="red_detection_target">
+      <static>true</static>
+      <pose>24 -2 0.85 0 0 0</pose>
+      <link name="link">
+        <visual name="body">
+          <geometry><box><size>4.8 2.1 1.5</size></box></geometry>
+          <material><ambient>0.85 0.1 0.06 1</ambient><diffuse>0.85 0.1 0.06 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+    <model name="blue_detection_target">
+      <static>true</static>
+      <pose>34 5 0.9 0 0 0</pose>
+      <link name="link">
+        <visual name="body">
+          <geometry><box><size>5.2 2.2 1.6</size></box></geometry>
+          <material><ambient>0.05 0.42 0.95 1</ambient><diffuse>0.05 0.42 0.95 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="green_detection_target">
+      <static>true</static>
+      <pose>18 8 0.8 0 0 0</pose>
+      <link name="link">
+        <visual name="body">
+          <geometry><box><size>3.6 1.8 1.4</size></box></geometry>
+          <material><ambient>0.08 0.78 0.18 1</ambient><diffuse>0.08 0.78 0.18 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="yellow_detection_target">
+      <static>true</static>
+      <pose>15 -6 0.7 0 0 0</pose>
+      <link name="link">
+        <visual name="body">
+          <geometry><box><size>3.0 1.6 1.2</size></box></geometry>
+          <material><ambient>0.95 0.82 0.10 1</ambient><diffuse>0.95 0.82 0.10 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="orange_pillar">
+      <static>true</static>
+      <pose>28 12 1.2 0 0 0</pose>
+      <link name="link">
+        <visual name="body">
+          <geometry><cylinder><radius>0.6</radius><length>2.4</length></cylinder></geometry>
+          <material><ambient>0.95 0.50 0.05 1</ambient><diffuse>0.95 0.50 0.05 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="cyan_marker">
+      <static>true</static>
+      <pose>40 -8 0.9 0 0 0</pose>
+      <link name="link">
+        <visual name="body">
+          <geometry><box><size>2.4 2.4 1.8</size></box></geometry>
+          <material><ambient>0.10 0.80 0.85 1</ambient><diffuse>0.10 0.80 0.85 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="magenta_marker">
+      <static>true</static>
+      <pose>22 14 0.85 0 0 0</pose>
+      <link name="link">
+        <visual name="body">
+          <geometry><box><size>2.6 2.0 1.5</size></box></geometry>
+          <material><ambient>0.85 0.10 0.65 1</ambient><diffuse>0.85 0.10 0.65 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="teal_cone">
+      <static>true</static>
+      <pose>12 2 0.6 0 0 0</pose>
+      <link name="link">
+        <visual name="body">
+          <geometry><cylinder><radius>0.45</radius><length>1.2</length></cylinder></geometry>
+          <material><ambient>0.05 0.55 0.55 1</ambient><diffuse>0.08 0.65 0.62 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <include>
+      <name>aruco_tag_a</name>
+      <pose>14 6 1.0 0 0 0</pose>
+      <uri>/home/sanju/PX4-Autopilot/Tools/simulation/gz/models/arucotag</uri>
+    </include>
+
+    <include>
+      <name>helipad_a</name>
+      <pose>20 -12 0.05 0 0 0</pose>
+      <uri>/home/sanju/PX4-Autopilot/Tools/simulation/gz/models/helipad</uri>
+    </include>
+
+    <include>
+      <name>rover_a</name>
+      <pose>38 -3 0.0 0 0 1.5708</pose>
+      <uri>/home/sanju/PX4-Autopilot/Tools/simulation/gz/models/r1_rover</uri>
+    </include>
+
+    <include>
+      <name>cessna_a</name>
+      <pose>10 -3 0.3 0 0 0.6</pose>
+      <uri>/home/sanju/PX4-Autopilot/Tools/simulation/gz/models/rc_cessna</uri>
+    </include>
+
+    <include>
+      <name>x500_static</name>
+      <pose>30 -6 0.6 0 0 0</pose>
+      <uri>/home/sanju/PX4-Autopilot/Tools/simulation/gz/models/x500</uri>
+    </include>
+
+    <include>
+      <name>person_left</name>
+      <pose>26 -10 0.0 0 0 0</pose>
+      <uri>/home/sanju/.gz/fuel/fuel.gazebosim.org/openrobotics/models/standing%20person/3</uri>
+    </include>
+  </world>
+</sdf>
