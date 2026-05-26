@@ -1381,7 +1381,7 @@ def api_paint():
 
 @app.post("/api/sweep")
 def api_sweep():
-    global sweep_enabled, sweep_painted_names, sweep_last_advance_ts, mode
+    global sweep_enabled, sweep_painted_names, sweep_last_advance_ts
     data = request.get_json(force=True, silent=True) or {}
     with lock:
         if "enabled" in data:
@@ -1389,11 +1389,9 @@ def api_sweep():
         if data.get("reset_painted") or sweep_enabled:
             sweep_painted_names = set()
             sweep_last_advance_ts = 0.0
-        if sweep_enabled:
-            clear_selection()
-            mode = "auto"
     return jsonify({"ok": True, "sweep_enabled": sweep_enabled,
-                    "painted_names": sorted(sweep_painted_names)})
+                    "painted_names": sorted(sweep_painted_names),
+                    "mode": mode})
 
 
 @app.post("/api/paint_auto")
