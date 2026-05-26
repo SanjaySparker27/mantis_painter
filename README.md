@@ -1,113 +1,173 @@
 # MANTIS PAINTER
 
-Realtime persistent tracking with precision control.
+Realtime persistent tracking with precision pan/tilt control. Gazebo Harmonic simulation built on top of a Blender-derived MANTIS chassis. Educational scope only — no projectile physics, no real-world deployment instructions. Paint events are virtual signals (gz topic + file) so an external Raspberry Pi or MCU can react over PWM / GPIO if wired.
 
-MANTIS PAINTER is a fixed-place Gazebo simulation for educational perception, tracking, and pan/tilt control research.
+![nose camera view with object detections, track IDs, crosshair and live PID values](docs/assets/nose_camera.jpg)
 
-It uses the provided Blender-derived MANTIS geometry, a real Gazebo nose camera topic, object detection overlays in a browser Web UI, and joint commands for the pan and tilt axes. It does not simulate projectile physics or real-world deployment behavior. The only event output is a non-physical `virtual_mark` when a selected target is held near the camera center.
+## What kind of tracking is this?
 
-## Current System
+Object-level tracking, not blind pixel tracking.
 
-- Simulator: Gazebo Harmonic / gz-sim.
-- Robot model: `models/mantis_robot/model.sdf`.
-- World: `worlds/mantis_robot_world.sdf`.
-- Live camera topic: `/mantis/nose_camera/image`.
-- Pan command topic: `/mantis/pan_cmd`.
-- Tilt command topic: `/mantis/tilt_cmd`.
-- Web UI: `http://127.0.0.1:5055`.
-- Source Blender file: `/home/sanju/Documents/BLENDER/MANTIS.blend`.
+| layer | what it does | implementation |
+|---|---|---|
+| Detection | finds what objects are in the frame | **OpenCV HSV color masks** (red, blue, green, yellow, cyan, magenta, orange, brown, teal, purple) **or YOLOv12n** (`ultralytics`) on the same frame |
+| Track association | keeps a stable identity for the same object across frames | **ByteTrack** (Kalman filter + IoU association) for YOLO mode; **name + nearest-bbox-anchor** with a 240 px gate for color mode |
+| Pose control | converts bbox-center pixel error to a joint-angle command | FOV-aware mapping `θ = atan(tan(FOV/2) · n)`, cascaded outer PID on the **actual** joint state, inner Gazebo `JointPositionController` |
 
-Extracted rotation limits from the Blender file:
+So the controller does not chase a pixel — it chases a *tracked object*. If the bbox jitters by 5 px the smoothed center barely moves; if YOLO swaps the IDs of two cars, ByteTrack keeps the one you clicked.
 
-- Pan: `-85.3` to `+89.2` degrees.
-- Tilt: `-40.0` to `+30.0` degrees.
+## Features
+
+### Perception
+- Live `gz.msgs.Image` subscription on `/mantis/nose_camera/image` (1280×720, 30 Hz, HFOV 1.012 rad)
+- HSV color detector with 10+ named color classes
+- **YOLOv12n** detector via `ultralytics` (auto-downloaded on first launch)
+- **ByteTrack** multi-object tracker with persistent IDs
+- Async detection thread — heavy inference never blocks the Flask UI
+- Detection score filter (`MIN_TRACK_SCORE = 0.15`) to ignore weak hits
+
+### Tracking
+- Real-`dt` PID (not fixed `CONTROL_HZ`)
+- FOV-aware pixel-to-angle conversion using `atan(tan(FOV/2) · n)`
+- Feedback on **actual** joint position (from `/mantis/joint_states`), not the commanded angle — kills steady-state offset from gravity
+- Target-velocity feed-forward with EMA smoothing on bbox centre
+- Anti-windup integral clamp, deadband freeze, output low-pass filter
+- Lost-target grace (0.8 s) then auto-clear and home
+- Identity-stable selection: ByteTrack ID for YOLO, name + nearest-anchor for color
+
+### Control modes
+| button | behaviour |
+|---|---|
+| `Tracking: ON/OFF` | toggle auto-tracking of the selected target |
+| `Auto track+paint` | fully autonomous: pick next un-painted target, centre, paint, advance. No user input needed. Works even when Tracking is OFF |
+| `Manual / Jog pad / Arrow keys` | drive pan & tilt directly with step size 0.5°–10° |
+| `Home` | smooth return to `pan=0, tilt=12°` |
+| `STOP` | freeze cmd at current actual angles |
+| `Click-to-Aim` | clicks on the feed aim the camera at that pixel instead of selecting a bbox |
+| `PAINT` | one paint pulse on current target (or image centre). Key `P` |
+| `Auto-tune` | step-response FOPDT identification + Cohen-Coon → applies gains |
+
+### Web UI
+- Live MJPEG feed at `http://127.0.0.1:5055`
+- Overlay: bounding boxes with track IDs + names, crosshair, HUD with pan/tilt/gains/paint count, paint splash animation on trigger
+- Live PID sliders that POST to `/api/gains` while you drag (Speed / Hold / Smooth / Max slew / Lock zone)
+- Detector toggle YOLO ↔ Color
+- Detections table with click-to-select buttons
+- Virtual marks history panel
+- Status badge with current mode and sweep indicator
+
+### Hardware-out
+- Paint events publish `gz.msgs.Int32(pulse_ms)` on `/mantis/paint_trigger`
+- Same event appended to `/tmp/mantis_paint.signal` (one line per pulse)
+- A Pi or MCU can subscribe to the topic or tail the file and drive a real GPIO/PWM pin. The sim itself does **not** instantiate any projectile or physical actuator.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  GZ[Gazebo Harmonic\nworld + sensors] -- /mantis/nose_camera/image --> CAM
+  GZ -- /mantis/joint_states --> JS
+
+  subgraph WEBAPP[web_app.py]
+    CAM[image_to_bgr] --> DETW[detection_worker thread]
+    DETW -- HSV / YOLO+ByteTrack --> DETS[(detections list)]
+    CAM --> CT[control_tick]
+    DETS --> AUTO[auto_control_step]
+    JS --> AUTO
+    CT --> AUTO
+    CT --> MAN[manual_control_step]
+    CT --> HOME[home_control_step]
+    AUTO --> PUB[publish pan/tilt cmd]
+    AUTO --> PAINT[trigger_paint]
+  end
+
+  PUB -- gz.msgs.Double --> GZ
+  PAINT -- gz.msgs.Int32 --> EXT[Pi / MCU\nGPIO + PWM]
+  PAINT -- file write --> SIG[/tmp/mantis_paint.signal]
+  WEBAPP -- Flask HTTP --> BROWSER[Browser UI]
+  BROWSER -- /api/select, /api/mode,\n/api/gains, /api/paint, ... --> WEBAPP
+```
+
+## Control loop
+
+```mermaid
+flowchart TB
+  A[bbox center cx, cy] --> B[EMA smooth β=0.20]
+  B --> C[normalize nx, ny in -1..1]
+  C --> D{inside deadband?}
+  D -- yes --> E[freeze cmd toward actual,\ndecay integral]
+  D -- no --> F[θ = atan tan FOV/2 · n in degrees]
+  F --> G[PID: Kp·θ + Ki·∫θ dt + Kd·dθ/dt]
+  JS2[actual_pan_deg from joint_states] --> H
+  G --> H[desired = actual + sign · u]
+  H --> I[step = clamp desired - cmd within ±max_rate · dt]
+  I --> J[cmd += lpf · step]
+  J --> K[publish radians on /mantis/pan_cmd]
+```
 
 ## Run
 
 Terminal 1:
-
 ```bash
 cd /home/sanju/MANTIS_PAINTER
 gz sim -v 3 worlds/mantis_robot_world.sdf
 ```
 
 Terminal 2:
-
 ```bash
 cd /home/sanju/MANTIS_PAINTER
-python3 web_app.py
+/home/sanju/venv-ardupilot/bin/python3 web_app.py     # needs flask + gz python + ultralytics
 ```
 
-Open:
+Open `http://127.0.0.1:5055`.
 
-```text
-http://127.0.0.1:5055
-```
+## Important files
 
-Use the browser UI to:
+- `web_app.py` — Flask UI, gz transport subscriber, color+YOLO+ByteTrack detector, cascaded PID with actual-joint feedback, paint trigger
+- `worlds/mantis_robot_world.sdf` — road, colored boxes, helipad, ArUco tag, x500 quad, rc_cessna, r1_rover, pickup, prius, standing person, MANTIS robot
+- `models/mantis_robot/model.sdf` — pan/tilt joints with analytic-PID JointPositionController, JointStatePublisher, world-fixed base
+- `scripts/pid_autotune.py` — standalone CLI Cohen-Coon autotune (the in-app `Auto-tune` button uses the same algorithm in-process)
+- `scripts/export_mantis_robot.py` — exports Blender objects into Gazebo meshes + SDF
+- `scripts/inspect_blend.py` — inspects Blender hierarchy and rotation constraints
+- `docs/MECHANISM_AND_3D_ASSETS.md` — exact 3D file paths, joint limits, topics
+- `docs/RESEARCH_UPGRADE_PLAN.md` — suggested non-harmful research upgrades
 
-- View the real Gazebo nose-camera feed.
-- See colored target detections and bounding boxes.
-- Click a detected object or select it from the detections table.
-- Let the controller center the selected object using pan and tilt.
-- Use `Home / clear target` to cancel selection and return to the forward home pose.
+## Topics
 
-## Important Files
+| topic | type | direction |
+|---|---|---|
+| `/mantis/nose_camera/image` | `gz.msgs.Image` | sim → web_app |
+| `/mantis/joint_states` | `gz.msgs.Model` | sim → web_app |
+| `/mantis/pan_cmd` | `gz.msgs.Double` (rad) | web_app → sim |
+| `/mantis/tilt_cmd` | `gz.msgs.Double` (rad) | web_app → sim |
+| `/mantis/paint_trigger` | `gz.msgs.Int32` (pulse ms) | web_app → external |
 
-- `web_app.py`: Flask Web UI, Gazebo image subscriber, color detector, and bounded PID-style pan/tilt controller.
-- `worlds/mantis_robot_world.sdf`: main world with road, vehicles, target markers, MANTIS robot, camera, and GUI plugins.
-- `models/mantis_robot/model.sdf`: robot links, joints, limits, nose camera, and Gazebo joint position controllers.
-- `scripts/export_mantis_robot.py`: exports Blender objects into simulation meshes and SDF.
-- `scripts/inspect_blend.py`: inspects Blender object hierarchy and rotation constraints.
-- `docs/MECHANISM_AND_3D_ASSETS.md`: exact 3D files, Gazebo links, joints, limits, topics, and how rotation is controlled.
-- `docs/RESEARCH_UPGRADE_PLAN.md`: suggested non-harmful research upgrades.
-- `docs/SAFE_CLAUDE_CODE_PROMPT.md`: prompt template for using Claude Code safely.
+Joint limits (from Blender source):
+- Pan: −85.3° to +89.2°
+- Tilt: −40.0° to +30.0°
 
-## Controller Notes
+## Keyboard
 
-The controller is a real-`dt` PID with FOV-aware error mapping:
+| key | action |
+|---|---|
+| arrows / WASD | jog pan / tilt by selected step |
+| Space | Home |
+| T | toggle Tracking ON/OFF |
+| C | Clear target |
+| P | one paint pulse |
+| Esc / X | STOP |
 
-- Image error is converted to a true off-axis angle via `atan(tan(FOV/2)*nx)`.
-- PID runs at the real camera frame rate (no fixed `CONTROL_HZ` assumption).
-- Anti-windup clamp on the integral, derivative on smoothed pixel error.
-- Output is a degree correction; the actual joint step is rate-limited.
-- Target identity is held across frames by name + nearest-anchor matching so
-  multiple same-color targets do not cause the track to jump.
-- Modes: `auto` (track), `manual` (jog only), `home` (smooth return to 0, 12).
-- Lost target: holds for 0.8 s, then auto-clears and homes.
-
-Web UI controls:
-
-- Mode buttons, Clear target.
-- Jog pad with selectable step (0.5°–10°).
-- Keyboard: arrows / WASD jog, Space = home, C = clear, M = manual, T = auto.
-- Live sliders for `Kp`, `Ki`, `Kd`, `max_rate`, `deadband`.
-
-Joint position controllers in `model.sdf` were retuned (pan p=900 d=500, tilt
-p=700 d=360) because the previous gains (p=8, d=0.25) left the joints
-underdamped and let pan drift even with a zero command.
-
-Tuning workflow:
-
-- Reduce `deadband` for tighter centering, raise it if jitter appears.
-- Raise `Kp` until response is fast but not oscillating.
-- Add `Kd` until overshoot disappears.
-- Keep `Ki` small; it is only for steady offset.
-- Keep `max_rate` realistic (deg/s) so the joint can follow.
-
-## Safe Scope
+## Safe scope
 
 Keep this project focused on:
+- robotic perception
+- camera simulation
+- multi-object tracking
+- pan/tilt servo control
+- evaluation metrics
+- non-physical virtual marking
 
-- Robotic perception.
-- Camera simulation.
-- Multi-object tracking.
-- Pan/tilt servo control.
-- Evaluation metrics.
-- Non-physical virtual marking.
-
-Avoid adding:
-
-- Real firing, impact, or projectile models.
-- Instructions for constructing or deploying a physical launcher.
-- Autonomous engagement logic outside a closed educational simulation.
+Do not add:
+- real firing, impact or projectile models
+- instructions for building or deploying a physical launcher
+- autonomous engagement logic outside this closed educational simulation

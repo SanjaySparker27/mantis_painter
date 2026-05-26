@@ -584,7 +584,11 @@ def control_tick(width: int, height: int) -> None:
         # autotune / external publisher owns /mantis/pan_cmd & /mantis/tilt_cmd
         return
 
-    if mode == "auto":
+    # Sweep is independent of mode: when ON it always runs the autonomous
+    # pick → center → paint → next loop, even if Tracking is OFF.
+    if sweep_enabled:
+        auto_control_step(width, height, dt)
+    elif mode == "auto":
         auto_control_step(width, height, dt)
     elif mode == "manual":
         manual_control_step(dt)
@@ -771,13 +775,12 @@ HTML_PAGE = r"""
 
       <div class="sect-head">Mode</div>
       <div class="row">
-        <button id="mAuto" class="active" title="auto-track the selected target">Tracking: ON</button>
-        <button id="mManual" title="ignore detections, use jog buttons only">Manual</button>
+        <button id="bTrack" class="active" title="auto-track the selected target (click a target first)">Tracking: ON</button>
         <button id="mHome" title="return to home pose">Home</button>
         <button id="mStop" style="background:#5a2126;border-color:#a23a3a" title="freeze in place">STOP</button>
-        <button id="clear" title="forget the current target">Clear target</button>
+        <button id="clear" title="forget current target">Clear</button>
         <button id="bPaint" style="background:#1f4d8c;border-color:#3a78c0" title="trigger one paint pulse (key P)">PAINT</button>
-        <button id="bSweep" title="auto-cycle through every detected target, paint each once">Auto-paint all: OFF</button>
+        <button id="bSweep" title="fully autonomous: pick → center → paint → next target. No clicks needed.">Auto track+paint: OFF</button>
       </div>
 
       <div class="sect-head">Detector</div>
@@ -833,19 +836,24 @@ HTML_PAGE = r"""
 <script>
 const feed=document.getElementById('feed');
 const stepSel=document.getElementById('step');
-const modeBtns={auto:mAuto,manual:mManual,home:mHome,stop:mStop};
-
 function setMode(m){
   if(m==='stop'){
     fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
   }else{
     fetch('/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})});
   }
-  for(const k in modeBtns) modeBtns[k].classList.toggle('active',k===m);
   modeBadge.textContent=m;
 }
-mAuto.onclick=()=>setMode('auto');
-mManual.onclick=()=>setMode('manual');
+let trackingOn=true;
+function setTrackingUI(){
+  bTrack.textContent='Tracking: '+(trackingOn?'ON':'OFF');
+  bTrack.classList.toggle('active',trackingOn);
+}
+bTrack.onclick=()=>{
+  trackingOn=!trackingOn;
+  setTrackingUI();
+  setMode(trackingOn?'auto':'manual');
+};
 mHome.onclick=()=>setMode('home');
 mStop.onclick=()=>setMode('stop');
 bPaint.onclick=async ()=>{
@@ -857,7 +865,7 @@ bPaint.onclick=async ()=>{
 let sweepOn=false;
 bSweep.onclick=async ()=>{
   sweepOn=!sweepOn;
-  bSweep.textContent='Auto-paint all: '+(sweepOn?'ON':'OFF');
+  bSweep.textContent='Auto track+paint: '+(sweepOn?'ON':'OFF');
   bSweep.classList.toggle('active',sweepOn);
   await fetch('/api/sweep',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:sweepOn})});
 };
@@ -910,8 +918,7 @@ document.addEventListener('keydown',e=>{
   else if(k==='arrowdown'||k==='s'){jog('tilt-down');e.preventDefault();}
   else if(k===' '){setMode('home');e.preventDefault();}
   else if(k==='c'){clear.click();}
-  else if(k==='m'){setMode('manual');}
-  else if(k==='t'){setMode('auto');}
+  else if(k==='t'){bTrack.click();}
   else if(k==='escape'||k==='x'){setMode('stop');e.preventDefault();}
 });
 
@@ -961,8 +968,9 @@ async function poll(){
     detCount.textContent=s.detections.length;
     pan.textContent=s.pan_deg.toFixed(1);
     tilt.textContent=s.tilt_deg.toFixed(1);
-    modeBadge.textContent=s.mode;
-    for(const k in modeBtns) modeBtns[k].classList.toggle('active',k===s.mode);
+    modeBadge.textContent=s.mode+(s.sweep_enabled?' (sweep)':'');
+    trackingOn = (s.mode==='auto');
+    setTrackingUI();
     yoloStatus.textContent=s.yolo_status||'';
     dAuto.classList.toggle('active',s.detector_mode==='auto');
     dColor.classList.toggle('active',s.detector_mode==='color');
