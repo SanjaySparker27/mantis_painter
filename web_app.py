@@ -9,6 +9,17 @@ from dataclasses import dataclass
 import cv2
 import gz.transport13 as gz_transport
 import numpy as np
+
+# Limit thread fan-out: cv2 + numpy + torch (via env) all default to all cores
+# which makes YOLO + draw_overlay starve the Flask/MJPEG threads. Pin them.
+cv2.setNumThreads(1)
+try:
+    import os as _os
+    _os.environ.setdefault("OMP_NUM_THREADS", "2")
+    _os.environ.setdefault("MKL_NUM_THREADS", "2")
+    _os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+except Exception:
+    pass
 from flask import Flask, Response, jsonify, request
 from gz.msgs10.double_pb2 import Double
 from gz.msgs10.image_pb2 import Image
@@ -171,6 +182,15 @@ def _load_yolo():
     if _yolo_model is not None:
         return _yolo_model
     try:
+        import torch  # type: ignore
+        torch.set_num_threads(2)
+        try:
+            torch.set_num_interop_threads(1)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
         from ultralytics import YOLO  # type: ignore
     except Exception as exc:
         yolo_status = f"ultralytics import failed: {exc}"
@@ -207,7 +227,7 @@ def detect_with_yolo(frame: np.ndarray) -> list[Detection] | None:
             tracker=_yolo_tracker_cfg,
             conf=0.30,
             iou=0.5,
-            imgsz=640,
+            imgsz=384,
             verbose=False,
         )
     except Exception as exc:
@@ -707,6 +727,8 @@ def draw_overlay(frame: np.ndarray) -> np.ndarray:
 
 
 _detection_thread_busy = False
+_detection_last_dispatch = 0.0
+DETECTION_INTERVAL_S = 1.0 / 8.0  # cap detection at 8 Hz to free CPU
 
 
 def run_detector(frame: np.ndarray) -> list[Detection]:
@@ -754,8 +776,12 @@ def on_image(msg: Image) -> None:
     ok, jpg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 72])
     if ok:
         latest_annotated = jpg.tobytes()
-    if not _detection_thread_busy:
+    global _detection_last_dispatch
+    now = time.time()
+    if (not _detection_thread_busy
+            and (now - _detection_last_dispatch) >= DETECTION_INTERVAL_S):
         _detection_thread_busy = True
+        _detection_last_dispatch = now
         threading.Thread(target=detection_worker, args=(frame,),
                          daemon=True).start()
 
@@ -799,7 +825,8 @@ HTML_PAGE = r"""
     main{display:grid;grid-template-columns:minmax(640px,1.35fr) minmax(380px,.65fr);gap:12px;padding:12px}
     section{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
     .title{height:38px;display:flex;align-items:center;justify-content:space-between;padding:0 12px;border-bottom:1px solid var(--line);color:var(--muted);font-size:13px}
-    #feed{width:100%;aspect-ratio:16/9;display:block;background:#050607;cursor:crosshair}
+    #feedWrap{position:relative;overflow:hidden;background:#050607;aspect-ratio:16/9;cursor:crosshair}
+    #feed{width:100%;aspect-ratio:16/9;display:block;background:#050607;cursor:crosshair;transform-origin:center center;transition:transform .12s ease-out}
     .stats{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;padding:10px}
     .stat{border:1px solid var(--line);border-radius:6px;padding:10px;min-height:62px}
     .label{color:var(--muted);font-size:12px}
@@ -828,8 +855,15 @@ HTML_PAGE = r"""
 <main>
   <div>
     <section>
-      <div class="title"><span>Live Nose Camera</span><span id="status">connecting</span></div>
-      <img id="feed" src="/video_feed">
+      <div class="title">
+        <span>Live Nose Camera</span>
+        <span style="display:flex;gap:8px;align-items:center">
+          <label class="label">zoom <input id="zoom" type="range" min="1" max="4" step="0.1" value="1" style="width:120px;vertical-align:middle"></label>
+          <span id="zoomV" class="label">1.0x</span>
+          <span id="status">connecting</span>
+        </span>
+      </div>
+      <div id="feedWrap"><img id="feed" src="/video_feed"></div>
     </section>
   </div>
   <div>
@@ -849,7 +883,8 @@ HTML_PAGE = r"""
         <button id="mStop" style="background:#5a2126;border-color:#a23a3a" title="freeze in place">STOP</button>
         <button id="clear" title="forget current target">Clear</button>
         <button id="bPaint" style="background:#1f4d8c;border-color:#3a78c0" title="trigger one paint pulse (key P)">PAINT</button>
-        <button id="bSweep" title="fully autonomous: pick → center → paint → next target. Remembers painted targets across sessions.">Auto Serial Tracker: OFF</button>
+        <button id="bPaintAuto" title="auto-fire paint when selected target stays centered (stays on the SAME target)">Auto Paint: OFF</button>
+        <button id="bSweep" title="full autonomous loop: pick → center → paint → NEXT target. Remembers painted targets across sessions.">Auto Serial Tracker: OFF</button>
         <button id="bSweepReset" title="forget painted memory">Reset memory</button>
       </div>
 
@@ -932,6 +967,13 @@ bPaint.onclick=async ()=>{
   catch(e){}
   setTimeout(()=>bPaint.disabled=false, 250);
 };
+let autoPaintOn=false;
+bPaintAuto.onclick=async ()=>{
+  autoPaintOn=!autoPaintOn;
+  bPaintAuto.textContent='Auto Paint: '+(autoPaintOn?'ON':'OFF');
+  bPaintAuto.classList.toggle('active',autoPaintOn);
+  await fetch('/api/paint_auto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:autoPaintOn})});
+};
 let sweepOn=false;
 bSweep.onclick=async ()=>{
   sweepOn=!sweepOn;
@@ -956,6 +998,15 @@ dAuto.onclick=()=>setDetector('auto');
 dColor.onclick=()=>setDetector('color');
 
 let clickAim=false;
+let zoomVal=1.0;
+const zoomEl=document.getElementById('zoom'),zoomLbl=document.getElementById('zoomV');
+function applyZoom(){
+  zoomVal=parseFloat(zoomEl.value);
+  feed.style.transform='scale('+zoomVal+')';
+  zoomLbl.textContent=zoomVal.toFixed(1)+'x';
+}
+zoomEl.addEventListener('input',applyZoom);
+applyZoom();
 bClickAim.onclick=()=>{
   clickAim=!clickAim;
   bClickAim.textContent='Click-to-Aim: '+(clickAim?'ON':'OFF');
@@ -963,8 +1014,14 @@ bClickAim.onclick=()=>{
 };
 feed.addEventListener('click', async e=>{
   const r=feed.getBoundingClientRect();
-  const x=(e.clientX-r.left)/r.width*1280;
-  const y=(e.clientY-r.top)/r.height*720;
+  // bounding rect already reflects CSS transform; convert click back to
+  // original 1280x720 frame coordinates by un-scaling around center.
+  const w=r.width, h=r.height;
+  const cxScreen=r.left + w/2, cyScreen=r.top + h/2;
+  const dx=(e.clientX - cxScreen)/zoomVal;
+  const dy=(e.clientY - cyScreen)/zoomVal;
+  const x=(w/2 + dx)/w * 1280;
+  const y=(h/2 + dy)/h * 720;
   const url=clickAim?'/api/click_target':'/api/select';
   await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x,y})});
 });

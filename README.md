@@ -4,6 +4,12 @@ Realtime persistent tracking with precision pan/tilt control. Gazebo Harmonic si
 
 ![nose camera view with object detections, track IDs, crosshair and live PID values](docs/assets/nose_camera.jpg)
 
+### Convergence trace — selecting a car, controller centers it
+
+![pan and tilt cmd vs actual on top, normalized pixel error ex/ey on bottom](docs/assets/convergence.png)
+
+Top: blue = pan (cmd solid, actual dashed). Red = tilt (same). Bottom: normalized pixel error of the selected target's bbox center (`ex` horizontal, `ey` vertical). The dotted lines mark the deadband.
+
 ## What kind of tracking is this?
 
 Object-level tracking, not blind pixel tracking.
@@ -39,13 +45,16 @@ So the controller does not chase a pixel — it chases a *tracked object*. If th
 | button | behaviour |
 |---|---|
 | `Tracking: ON/OFF` | toggle auto-tracking of the selected target |
-| `Auto track+paint` | fully autonomous: pick next un-painted target, centre, paint, advance. No user input needed. Works even when Tracking is OFF |
+| `Auto Paint: ON/OFF` | fire one paint pulse whenever the selected target is centred and held. Stays on the same target |
+| `Auto Serial Tracker: ON/OFF` | fully autonomous loop: pick next un-painted target → centre → paint → advance. Remembers painted targets across sessions (`/tmp/mantis_painted_memory.json`). Independent of Tracking switch |
+| `Reset memory` | clear the painted-target memory |
 | `Manual / Jog pad / Arrow keys` | drive pan & tilt directly with step size 0.5°–10° |
 | `Home` | smooth return to `pan=0, tilt=12°` |
 | `STOP` | freeze cmd at current actual angles |
 | `Click-to-Aim` | clicks on the feed aim the camera at that pixel instead of selecting a bbox |
-| `PAINT` | one paint pulse on current target (or image centre). Key `P` |
+| `PAINT` | one paint pulse on current target. Key `P` |
 | `Auto-tune` | step-response FOPDT identification + Cohen-Coon → applies gains |
+| `zoom` slider | browser-side digital zoom 1×–4× on the live feed (clicks are corrected back to source coords) |
 
 ### Web UI
 - Live MJPEG feed at `http://127.0.0.1:5055`
