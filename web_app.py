@@ -248,6 +248,35 @@ def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+def safe_float(d: dict, key: str, default: float,
+               lo: float = -1e9, hi: float = 1e9) -> float:
+    try:
+        v = float(d.get(key, default))
+    except (TypeError, ValueError):
+        v = default
+    if not (lo <= v <= hi):
+        v = clamp(v, lo, hi)
+    return v
+
+
+def safe_int(d: dict, key: str, default: int,
+             lo: int = -10**9, hi: int = 10**9) -> int:
+    try:
+        v = int(d.get(key, default))
+    except (TypeError, ValueError):
+        v = default
+    return max(lo, min(hi, v))
+
+
+GAIN_BOUNDS = {
+    "kp": (0.0, 3.0),
+    "ki": (0.0, 2.0),
+    "kd": (0.0, 1.0),
+    "max_rate": (1.0, 200.0),
+    "deadband": (0.0, 0.20),
+}
+
+
 def publish_angle(pub, deg: float) -> None:
     msg = Double()
     msg.data = math.radians(deg)
@@ -506,8 +535,10 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     # derived from image error. Ki accumulates against any inner-PID bias so
     # the joint ends up exactly where the image error is zero. No cascaded
     # lead window — that drags cmd around with actual during overshoot.
-    actual_pan = actual_pan_deg if joint_state_stamp else pan_deg
-    actual_tilt = actual_tilt_deg if joint_state_stamp else tilt_deg
+    joint_fresh = (joint_state_stamp
+                   and (time.time() - joint_state_stamp) < JOINT_STALE_S)
+    actual_pan = actual_pan_deg if joint_fresh else pan_deg
+    actual_tilt = actual_tilt_deg if joint_fresh else tilt_deg
 
     desired_pan = actual_pan + PAN_SIGN * pan_u_deg
     desired_tilt = actual_tilt + TILT_SIGN * tilt_u_deg
@@ -595,6 +626,10 @@ def stop_control_step() -> None:
     publish_angle(tilt_pub, last_command_tilt_deg)
 
 
+CAMERA_STALE_S = 1.5
+JOINT_STALE_S = 2.0
+
+
 def control_tick(width: int, height: int) -> None:
     global last_control_ts, last_command_pan_deg, last_command_tilt_deg
     now = time.time()
@@ -607,6 +642,11 @@ def control_tick(width: int, height: int) -> None:
         return
     if mode == "passthrough":
         # autotune / external publisher owns /mantis/pan_cmd & /mantis/tilt_cmd
+        return
+    # Watchdog: if camera frames stop, freeze command rather than running
+    # blind. Detection list is also stale, so chasing it is dangerous.
+    if latest_stamp and (now - latest_stamp) > CAMERA_STALE_S:
+        stop_control_step()
         return
 
     # Sweep is independent of mode: when ON it always runs the autonomous
@@ -1064,6 +1104,31 @@ def video_feed():
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
+@app.get("/api/health")
+def api_health():
+    now = time.time()
+    cam_age = (now - latest_stamp) if latest_stamp else float("inf")
+    joint_age = (now - joint_state_stamp) if joint_state_stamp else float("inf")
+    issues = []
+    if cam_age > CAMERA_STALE_S:
+        issues.append(f"camera stale {cam_age:.1f}s")
+    if joint_age > JOINT_STALE_S:
+        issues.append(f"joint_state stale {joint_age:.1f}s")
+    if yolo_status.startswith(("load", "ultralytics", "detector exception", "track failed")):
+        if "loaded" not in yolo_status:
+            issues.append(f"detector: {yolo_status}")
+    ok = len(issues) == 0
+    return jsonify({
+        "ok": ok,
+        "camera_age_s": cam_age if cam_age != float("inf") else None,
+        "joint_age_s": joint_age if joint_age != float("inf") else None,
+        "frame_count": frame_count,
+        "paint_count": paint_count,
+        "mode": mode,
+        "issues": issues,
+    }), (200 if ok else 503)
+
+
 @app.get("/api/status")
 def api_status():
     with lock:
@@ -1120,8 +1185,8 @@ def api_select():
             return jsonify({"ok": True, "selected_id": selected_id,
                             "selected_name": selected_name, "mode": mode})
 
-        x = float(data.get("x", -1))
-        y = float(data.get("y", -1))
+        x = safe_float(data, "x", -1.0, -1.0, IMG_W * 2.0)
+        y = safe_float(data, "y", -1.0, -1.0, IMG_H * 2.0)
         selectable = detections
         if not selectable and time.time() - recent_detection_stamp < 1.0:
             selectable = recent_detections
@@ -1180,7 +1245,7 @@ def api_select():
 def api_select_detection():
     global selected_id, selected_name, selected_anchor_xy, mode
     data = request.get_json(force=True, silent=True) or {}
-    det_id = int(data.get("id", 0))
+    det_id = safe_int(data, "id", 0, -1, 10**6)
     with lock:
         selectable = detections
         if not selectable and time.time() - recent_detection_stamp < 1.0:
@@ -1231,8 +1296,8 @@ def api_jog():
             mode = "manual"
             clear_selection()
             return jsonify({"ok": True, "mode": mode})
-        dpan = float(data.get("dpan", 0.0))
-        dtilt = float(data.get("dtilt", 0.0))
+        dpan = safe_float(data, "dpan", 0.0, -180.0, 180.0)
+        dtilt = safe_float(data, "dtilt", 0.0, -90.0, 90.0)
         base_pan = jog_pan_target if jog_pan_target is not None else pan_deg
         base_tilt = jog_tilt_target if jog_tilt_target is not None else tilt_deg
         jog_pan_target = clamp(base_pan + dpan, PAN_LIMIT[0], PAN_LIMIT[1])
@@ -1256,17 +1321,20 @@ def api_gains():
             return jsonify({"ok": True, "reset": True})
         for key in ("kp", "ki", "kd"):
             if key in data:
-                v = float(data[key])
+                lo, hi = GAIN_BOUNDS[key]
+                v = safe_float(data, key, getattr(pan_gains, key), lo, hi)
                 setattr(pan_gains, key, v)
                 setattr(tilt_gains, key, v)
         if "max_rate" in data:
-            v = float(data["max_rate"])
+            lo, hi = GAIN_BOUNDS["max_rate"]
+            v = safe_float(data, "max_rate", pan_gains.max_rate_deg_s, lo, hi)
             pan_gains.max_rate_deg_s = v
-            tilt_gains.max_rate_deg_s = max(10.0, v * 0.8)
+            tilt_gains.max_rate_deg_s = clamp(v * 0.8, 1.0, hi)
         if "deadband" in data:
-            v = float(data["deadband"])
+            lo, hi = GAIN_BOUNDS["deadband"]
+            v = safe_float(data, "deadband", pan_gains.deadband_norm, lo, hi)
             pan_gains.deadband_norm = v
-            tilt_gains.deadband_norm = min(0.10, v * 1.3)
+            tilt_gains.deadband_norm = clamp(v * 1.3, lo, hi)
     return jsonify({"ok": True})
 
 
@@ -1422,8 +1490,7 @@ def trigger_paint(reason: str, pulse_ms: int = PAINT_PULSE_MS_DEFAULT) -> dict:
 @app.post("/api/paint")
 def api_paint():
     data = request.get_json(force=True, silent=True) or {}
-    pulse = int(data.get("pulse_ms", PAINT_PULSE_MS_DEFAULT))
-    pulse = max(10, min(2000, pulse))
+    pulse = safe_int(data, "pulse_ms", PAINT_PULSE_MS_DEFAULT, 10, 2000)
     with lock:
         rec = trigger_paint("manual", pulse)
     return jsonify({"ok": True, "record": rec, "paint_count": paint_count})
@@ -1461,8 +1528,8 @@ def api_paint_auto():
 def api_click_target():
     global mode, jog_pan_target, jog_tilt_target
     data = request.get_json(force=True, silent=True) or {}
-    x = float(data.get("x", IMG_W / 2.0))
-    y = float(data.get("y", IMG_H / 2.0))
+    x = safe_float(data, "x", IMG_W / 2.0, 0.0, float(IMG_W))
+    y = safe_float(data, "y", IMG_H / 2.0, 0.0, float(IMG_H))
     nx = (x - IMG_W / 2.0) / (IMG_W / 2.0)
     ny = (y - IMG_H / 2.0) / (IMG_H / 2.0)
     pan_off = math.degrees(math.atan(math.tan(HFOV_RAD / 2.0) * nx))
