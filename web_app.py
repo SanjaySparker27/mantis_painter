@@ -385,7 +385,8 @@ def step_toward(target_deg: float, current_deg: float, max_step_deg: float) -> f
 
 def auto_control_step(width: int, height: int, dt: float) -> None:
     global pan_deg, tilt_deg, pan_i_deg, tilt_i_deg, last_ex_norm, last_ey_norm
-    global centered_frames, selected_id, last_target_ts, selected_anchor_xy
+    global centered_frames, selected_id, selected_name, last_target_ts
+    global selected_anchor_xy, sweep_last_advance_ts
     global last_target_cx, last_target_cy, last_target_seen_ts
     global target_vx_pix_s, target_vy_pix_s
 
@@ -415,7 +416,6 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
                     selected_id = candidate.det_id
                     selected_name = candidate.name
                     selected_anchor_xy = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
-                    global sweep_last_advance_ts
                     sweep_last_advance_ts = now
                     return
             pan_deg = step_toward(HOME_PAN_DEG, pan_deg, HOME_MAX_RATE_DEG_S * dt)
@@ -702,18 +702,21 @@ def on_image(msg: Image) -> None:
     frame = image_to_bgr(msg)
     if frame is None:
         return
+    # Hold lock only for state mutations (control_tick + read of detections
+    # for draw_overlay). Encoding is done outside the lock so /api/status,
+    # /video_feed and the detection worker don't queue behind it.
     with lock:
         latest_raw = frame
         control_tick(frame.shape[1], frame.shape[0])
         annotated = draw_overlay(frame)
-        ok, jpg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 82])
-        if ok:
-            latest_annotated = jpg.tobytes()
         latest_stamp = time.time()
         frame_count += 1
+    ok, jpg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 72])
+    if ok:
+        latest_annotated = jpg.tobytes()
     if not _detection_thread_busy:
         _detection_thread_busy = True
-        threading.Thread(target=detection_worker, args=(frame.copy(),),
+        threading.Thread(target=detection_worker, args=(frame,),
                          daemon=True).start()
 
 
@@ -1024,7 +1027,7 @@ async function poll(){
 async function selectDetection(id){
   await fetch('/api/select_detection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
 }
-setInterval(poll,250); poll();
+setInterval(poll,500); poll();
 </script>
 </body>
 </html>
@@ -1039,18 +1042,25 @@ def index() -> Response:
 @app.get("/video_feed")
 def video_feed():
     def gen():
+        last_sent_stamp = 0.0
         while True:
-            with lock:
-                jpg = latest_annotated
+            jpg = latest_annotated
+            stamp = latest_stamp
             if jpg is None:
                 blank = np.zeros((720, 1280, 3), np.uint8)
                 cv2.putText(blank, "Waiting for /mantis/nose_camera/image",
                             (340, 360), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                             (240, 240, 240), 2)
-                _, encoded = cv2.imencode(".jpg", blank)
+                _, encoded = cv2.imencode(".jpg", blank, [cv2.IMWRITE_JPEG_QUALITY, 60])
                 jpg = encoded.tobytes()
-            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
-            time.sleep(1 / 20)
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+                time.sleep(0.10)
+                continue
+            if stamp != last_sent_stamp:
+                last_sent_stamp = stamp
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+            else:
+                time.sleep(0.015)
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
