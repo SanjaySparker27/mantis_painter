@@ -120,7 +120,7 @@ last_command_tilt_deg = 12.0
 paint_count = 0
 paint_last_ts = 0.0
 paint_auto = False
-paint_auto_min_centered = 25
+paint_auto_min_centered = 5
 paint_overlay_marks: list[dict] = []
 PAINT_OVERLAY_TTL_S = 1.6
 
@@ -128,6 +128,30 @@ sweep_enabled = False
 sweep_painted_names: set[str] = set()
 sweep_last_advance_ts = 0.0
 SWEEP_PER_TARGET_TIMEOUT_S = 8.0
+SWEEP_MEMORY_FILE = "/tmp/mantis_painted_memory.json"
+
+
+def _save_painted_memory():
+    try:
+        import json as _json
+        with open(SWEEP_MEMORY_FILE, "w") as f:
+            _json.dump(sorted(sweep_painted_names), f)
+    except Exception:
+        pass
+
+
+def _load_painted_memory():
+    global sweep_painted_names
+    try:
+        import json as _json, os as _os
+        if _os.path.exists(SWEEP_MEMORY_FILE):
+            with open(SWEEP_MEMORY_FILE) as f:
+                sweep_painted_names = set(_json.load(f))
+    except Exception:
+        sweep_painted_names = set()
+
+
+_load_painted_memory()
 
 LOST_GRACE_S = 0.8
 
@@ -518,22 +542,23 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     else:
         centered_frames = 0
     if (paint_auto and centered_frames == paint_auto_min_centered
-            and time.time() - paint_last_ts > 1.5):
+            and time.time() - paint_last_ts > 0.4):
         trigger_paint("auto-center-hold")
 
     if sweep_enabled:
-        # Sweep state machine: paint the locked target then advance.
+        # Auto-serial state machine: paint the locked target then advance.
         if (centered_frames >= paint_auto_min_centered
-                and time.time() - paint_last_ts > 1.0
+                and time.time() - paint_last_ts > 0.3
                 and target.name not in sweep_painted_names):
             trigger_paint(f"sweep:{target.name}")
             sweep_painted_names.add(target.name)
+            _save_painted_memory()
             clear_selection()
             return
         if (sweep_last_advance_ts
                 and now - sweep_last_advance_ts > SWEEP_PER_TARGET_TIMEOUT_S):
-            # Took too long — skip and try the next one.
             sweep_painted_names.add(target.name)
+            _save_painted_memory()
             clear_selection()
             return
 
@@ -634,9 +659,10 @@ def draw_overlay(frame: np.ndarray) -> np.ndarray:
     cv2.putText(out,
                 f"pan {pan_deg:6.1f} deg  tilt {tilt_deg:5.1f} deg  sel {selected_name or '-'}",
                 (28, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.66, (240, 245, 250), 2)
+    det_label = "YOLOv12+ByteTrack" if detector_mode == "auto" else "HSV+AnchorMatch"
     cv2.putText(out,
-                f"Kp {pan_gains.kp:.2f}  Ki {pan_gains.ki:.2f}  Kd {pan_gains.kd:.2f}  paint:{paint_count}",
-                (28, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (180, 200, 220), 2)
+                f"{det_label}  paint:{paint_count}  Kp {pan_gains.kp:.2f} Ki {pan_gains.ki:.2f} Kd {pan_gains.kd:.2f}",
+                (28, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (180, 200, 220), 2)
     return out
 
 
@@ -780,14 +806,15 @@ HTML_PAGE = r"""
         <button id="mStop" style="background:#5a2126;border-color:#a23a3a" title="freeze in place">STOP</button>
         <button id="clear" title="forget current target">Clear</button>
         <button id="bPaint" style="background:#1f4d8c;border-color:#3a78c0" title="trigger one paint pulse (key P)">PAINT</button>
-        <button id="bSweep" title="fully autonomous: pick → center → paint → next target. No clicks needed.">Auto track+paint: OFF</button>
+        <button id="bSweep" title="fully autonomous: pick → center → paint → next target. Remembers painted targets across sessions.">Auto Serial Tracker: OFF</button>
+        <button id="bSweepReset" title="forget painted memory">Reset memory</button>
       </div>
 
-      <div class="sect-head">Detector</div>
+      <div class="sect-head">Detector + Tracker</div>
       <div class="row">
-        <button id="dAuto" class="active">YOLO+ByteTrack</button>
-        <button id="dColor">Color</button>
-        <button id="bClickAim">Click-to-Aim: OFF</button>
+        <button id="dAuto" class="active" title="YOLOv12 detection + ByteTrack ID-stable tracker (Kalman + IoU)">YOLOv12 + ByteTrack</button>
+        <button id="dColor" title="HSV color detection + name+nearest-anchor tracker">HSV Color + AnchorMatch</button>
+        <button id="bClickAim" title="clicks aim camera at pixel instead of selecting a target">Click-to-Aim: OFF</button>
         <span class="label" id="yoloStatus" style="align-self:center">init</span>
       </div>
 
@@ -865,9 +892,12 @@ bPaint.onclick=async ()=>{
 let sweepOn=false;
 bSweep.onclick=async ()=>{
   sweepOn=!sweepOn;
-  bSweep.textContent='Auto track+paint: '+(sweepOn?'ON':'OFF');
+  bSweep.textContent='Auto Serial Tracker: '+(sweepOn?'ON':'OFF');
   bSweep.classList.toggle('active',sweepOn);
   await fetch('/api/sweep',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:sweepOn})});
+};
+bSweepReset.onclick=async ()=>{
+  await fetch('/api/sweep',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_painted:true})});
 };
 document.addEventListener('keypress',e=>{
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return;
@@ -983,7 +1013,8 @@ async function poll(){
     }
     if(s.sweep_enabled!==undefined){
       sweepOn=!!s.sweep_enabled;
-      bSweep.textContent='Auto-paint all: '+(sweepOn?'ON':'OFF');
+      const tail=s.sweep_painted&&s.sweep_painted.length?` [${s.sweep_painted.length} done]`:'';
+      bSweep.textContent='Auto Serial Tracker: '+(sweepOn?'ON':'OFF')+tail;
       bSweep.classList.toggle('active',sweepOn);
     }
     detRows.innerHTML=s.detections.map(d=>`<tr><td><button onclick="selectDetection(${d.id})">${d.id}</button></td><td>${d.name}</td><td>${(d.score*100).toFixed(0)}%</td></tr>`).join('');
@@ -1056,6 +1087,7 @@ def api_status():
                 "deadband": pan_gains.deadband_norm,
             },
             "detector_mode": detector_mode,
+            "tracker": ("ByteTrack" if detector_mode == "auto" else "AnchorMatch"),
             "yolo_status": yolo_status,
             "paint_count": paint_count,
             "paint_auto": paint_auto,
@@ -1394,9 +1426,10 @@ def api_sweep():
     with lock:
         if "enabled" in data:
             sweep_enabled = bool(data["enabled"])
-        if data.get("reset_painted") or sweep_enabled:
+        if data.get("reset_painted"):
             sweep_painted_names = set()
             sweep_last_advance_ts = 0.0
+            _save_painted_memory()
     return jsonify({"ok": True, "sweep_enabled": sweep_enabled,
                     "painted_names": sorted(sweep_painted_names),
                     "mode": mode})
@@ -1454,15 +1487,22 @@ def api_stop():
 
 @app.post("/api/detector")
 def api_detector():
-    global detector_mode
+    global detector_mode, detections
     data = request.get_json(force=True, silent=True) or {}
     requested = str(data.get("mode", "")).lower()
     if requested not in ("auto", "color"):
         return jsonify({"ok": False, "message": "detector mode must be auto|color"}), 400
     with lock:
+        if detector_mode != requested:
+            # Drop the stale detection list; next frame populates with the new
+            # detector. Avoids visible delay where bboxes from the old detector
+            # remain while the new one loads.
+            detections = []
         detector_mode = requested
     return jsonify({"ok": True, "detector_mode": detector_mode,
-                    "yolo_status": yolo_status})
+                    "yolo_status": yolo_status,
+                    "tracker": ("ByteTrack" if detector_mode == "auto"
+                                else "AnchorMatch")})
 
 
 @app.post("/api/command")

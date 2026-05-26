@@ -92,97 +92,28 @@
       <uri>/home/sanju/.gz/fuel/fuel.gazebosim.org/openrobotics/models/pickup/4</uri>
     </include>
 
-    <model name="red_detection_target">
-      <static>true</static>
-      <pose>24 -2 0.85 0 0 0</pose>
-      <link name="link">
-        <visual name="body">
-          <geometry><box><size>4.8 2.1 1.5</size></box></geometry>
-          <material><ambient>0.85 0.1 0.06 1</ambient><diffuse>0.85 0.1 0.06 1</diffuse></material>
-        </visual>
-      </link>
-    </model>
-    <model name="blue_detection_target">
-      <static>true</static>
-      <pose>34 5 0.9 0 0 0</pose>
-      <link name="link">
-        <visual name="body">
-          <geometry><box><size>5.2 2.2 1.6</size></box></geometry>
-          <material><ambient>0.05 0.42 0.95 1</ambient><diffuse>0.05 0.42 0.95 1</diffuse></material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="green_detection_target">
-      <static>true</static>
-      <pose>18 8 0.8 0 0 0</pose>
-      <link name="link">
-        <visual name="body">
-          <geometry><box><size>3.6 1.8 1.4</size></box></geometry>
-          <material><ambient>0.08 0.78 0.18 1</ambient><diffuse>0.08 0.78 0.18 1</diffuse></material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="yellow_detection_target">
-      <static>true</static>
-      <pose>15 -6 0.7 0 0 0</pose>
-      <link name="link">
-        <visual name="body">
-          <geometry><box><size>3.0 1.6 1.2</size></box></geometry>
-          <material><ambient>0.95 0.82 0.10 1</ambient><diffuse>0.95 0.82 0.10 1</diffuse></material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="orange_pillar">
-      <static>true</static>
-      <pose>28 12 1.2 0 0 0</pose>
-      <link name="link">
-        <visual name="body">
-          <geometry><cylinder><radius>0.6</radius><length>2.4</length></cylinder></geometry>
-          <material><ambient>0.95 0.50 0.05 1</ambient><diffuse>0.95 0.50 0.05 1</diffuse></material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="cyan_marker">
-      <static>true</static>
-      <pose>40 -8 0.9 0 0 0</pose>
-      <link name="link">
-        <visual name="body">
-          <geometry><box><size>2.4 2.4 1.8</size></box></geometry>
-          <material><ambient>0.10 0.80 0.85 1</ambient><diffuse>0.10 0.80 0.85 1</diffuse></material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="magenta_marker">
-      <static>true</static>
-      <pose>22 14 0.85 0 0 0</pose>
-      <link name="link">
-        <visual name="body">
-          <geometry><box><size>2.6 2.0 1.5</size></box></geometry>
-          <material><ambient>0.85 0.10 0.65 1</ambient><diffuse>0.85 0.10 0.65 1</diffuse></material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="teal_cone">
-      <static>true</static>
-      <pose>12 2 0.6 0 0 0</pose>
-      <link name="link">
-        <visual name="body">
-          <geometry><cylinder><radius>0.45</radius><length>1.2</length></cylinder></geometry>
-          <material><ambient>0.05 0.55 0.55 1</ambient><diffuse>0.08 0.65 0.62 1</diffuse></material>
-        </visual>
-      </link>
-    </model>
-
     <include>
       <name>aruco_tag_a</name>
       <pose>14 6 1.0 0 0 0</pose>
       <uri>/home/sanju/PX4-Autopilot/Tools/simulation/gz/models/arucotag</uri>
+    </include>
+
+    <include>
+      <name>aruco_tag_b</name>
+      <pose>28 12 1.0 0 0 0</pose>
+      <uri>/home/sanju/PX4-Autopilot/Tools/simulation/gz/models/arucotag</uri>
+    </include>
+
+    <include>
+      <name>car_pickup_b</name>
+      <pose>18 8 0.02 0 0 0</pose>
+      <uri>/home/sanju/.gz/fuel/fuel.gazebosim.org/openrobotics/models/pickup/4</uri>
+    </include>
+
+    <include>
+      <name>person_b</name>
+      <pose>40 -2 0.0 0 0 -1.5708</pose>
+      <uri>/home/sanju/.gz/fuel/fuel.gazebosim.org/openrobotics/models/standing%20person/3</uri>
     </include>
 
     <include>
