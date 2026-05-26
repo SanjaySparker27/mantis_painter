@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import math
+import os
+import socket
 import threading
 import time
 from dataclasses import dataclass
@@ -38,6 +41,28 @@ JOINT_STATE_TOPIC = "/mantis/joint_states"
 PAINT_TOPIC = "/mantis/paint_trigger"
 PAINT_SIGNAL_FILE = "/tmp/mantis_paint.signal"
 PAINT_PULSE_MS_DEFAULT = 120
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+
+# Paint output channels — each independent of the others. Any combination can
+# be enabled at runtime so the MANTIS can drive a Pi GPIO via serial, an MCU
+# via UDP, a network actuator via TCP, etc.
+paint_channels = {
+    "gz_topic": True,    # gz.msgs.Int32 on PAINT_TOPIC (default for sim)
+    "file": True,        # append line to PAINT_SIGNAL_FILE
+    "udp": False,
+    "tcp": False,
+    "serial": False,
+}
+paint_udp_addr = ("127.0.0.1", 9000)
+paint_tcp_addr = ("127.0.0.1", 9001)
+paint_serial_port = "/dev/ttyUSB0"
+paint_serial_baud = 9600
+
+agent_enabled = False
+agent_model: str | None = None
+agent_status = "idle"
+agent_chat_log: list[dict] = []
 
 IMG_W = 1280
 IMG_H = 720
@@ -933,6 +958,43 @@ HTML_PAGE = r"""
       <table><thead><tr><th>ID</th><th>Name</th><th>Score</th></tr></thead><tbody id="detRows"></tbody></table>
     </section>
     <section style="margin-top:12px">
+      <div class="title">
+        <span>Agent (Ollama)</span>
+        <span style="display:flex;gap:6px;align-items:center">
+          <select id="agentModel" style="max-width:160px"></select>
+          <button id="bAgentToggle">Agent: OFF</button>
+        </span>
+      </div>
+      <div id="chatLog" style="height:180px;overflow-y:auto;padding:8px 12px;font-size:13px;background:#0d1013;border-bottom:1px solid var(--line)"></div>
+      <div class="row" style="padding:8px 10px">
+        <input id="chatIn" type="text" placeholder="tell the agent (e.g. paint the car)" style="flex:1;height:30px;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:6px;padding:0 8px">
+        <button id="chatSend">Send</button>
+      </div>
+    </section>
+
+    <section style="margin-top:12px">
+      <div class="title"><span>Output channels (paint signal)</span><span>multi-select</span></div>
+      <div class="row" style="flex-wrap:wrap">
+        <label class="label"><input type="checkbox" id="chGz" checked> gz topic</label>
+        <label class="label"><input type="checkbox" id="chFile" checked> file</label>
+        <label class="label"><input type="checkbox" id="chUdp"> UDP</label>
+        <label class="label"><input type="checkbox" id="chTcp"> TCP</label>
+        <label class="label"><input type="checkbox" id="chSerial"> serial</label>
+      </div>
+      <div class="row" style="flex-wrap:wrap">
+        <label class="label">UDP host <input id="udpHost" value="127.0.0.1" style="width:110px;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 4px"></label>
+        <label class="label">port <input id="udpPort" value="9000" style="width:70px;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 4px"></label>
+        <label class="label">TCP host <input id="tcpHost" value="127.0.0.1" style="width:110px;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 4px"></label>
+        <label class="label">port <input id="tcpPort" value="9001" style="width:70px;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 4px"></label>
+      </div>
+      <div class="row" style="flex-wrap:wrap">
+        <label class="label">Serial <input id="serPort" value="/dev/ttyUSB0" style="width:130px;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 4px"></label>
+        <label class="label">baud <input id="serBaud" value="9600" style="width:80px;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 4px"></label>
+        <button id="chSave">Apply</button>
+      </div>
+    </section>
+
+    <section style="margin-top:12px">
       <div class="title"><span>Virtual Marks</span><span>center-hold events</span></div>
       <table><thead><tr><th>Target</th><th>Pan</th><th>Tilt</th></tr></thead><tbody id="marks"></tbody></table>
     </section>
@@ -1125,6 +1187,64 @@ async function selectDetection(id){
   await fetch('/api/select_detection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
 }
 setInterval(poll,500); poll();
+
+let agentOn=false;
+async function refreshAgentModels(){
+  const r=await fetch('/api/agent/models').then(r=>r.json());
+  const sel=document.getElementById('agentModel');
+  const cur=sel.value;
+  sel.innerHTML=(r.models||[]).map(m=>`<option value="${m}">${m}</option>`).join('');
+  if(r.selected) sel.value=r.selected; else if(cur) sel.value=cur;
+  agentOn=!!r.enabled;
+  bAgentToggle.textContent='Agent: '+(agentOn?'ON':'OFF');
+  bAgentToggle.classList.toggle('active',agentOn);
+}
+refreshAgentModels();
+setInterval(refreshAgentModels, 15000);
+bAgentToggle.onclick=async()=>{
+  agentOn=!agentOn;
+  const m=document.getElementById('agentModel').value || null;
+  await fetch('/api/agent/enable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:agentOn,model:m})});
+  bAgentToggle.textContent='Agent: '+(agentOn?'ON':'OFF');
+  bAgentToggle.classList.toggle('active',agentOn);
+};
+function appendChat(role,text){
+  const log=document.getElementById('chatLog');
+  const div=document.createElement('div');
+  div.style.margin='4px 0';
+  div.innerHTML=`<b style="color:${role==='user'?'#56cfe1':'#ffd166'}">${role}:</b> ${text}`;
+  log.appendChild(div); log.scrollTop=log.scrollHeight;
+}
+chatSend.onclick=async()=>{
+  const t=chatIn.value.trim(); if(!t) return;
+  chatIn.value=''; appendChat('user',t);
+  if(!agentOn){ appendChat('system','agent off; toggle on'); return; }
+  const r=await fetch('/api/agent/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:t})}).then(r=>r.json());
+  if(r.ok){
+    appendChat('agent', (r.reply||'').replace(/\n/g,'<br>'));
+    if(r.action) appendChat('action', `${r.action} -> ${r.action_result}`);
+  } else { appendChat('error', r.error||'unknown'); }
+};
+chatIn.addEventListener('keydown',e=>{ if(e.key==='Enter'){ chatSend.click(); }});
+
+async function pushChannels(){
+  const body={
+    channels:{gz_topic:chGz.checked,file:chFile.checked,udp:chUdp.checked,tcp:chTcp.checked,serial:chSerial.checked},
+    udp:{host:udpHost.value,port:parseInt(udpPort.value)||9000},
+    tcp:{host:tcpHost.value,port:parseInt(tcpPort.value)||9001},
+    serial:{port:serPort.value,baud:parseInt(serBaud.value)||9600},
+  };
+  await fetch('/api/channels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+}
+chSave.onclick=pushChannels;
+[chGz,chFile,chUdp,chTcp,chSerial].forEach(el=>el.addEventListener('change',pushChannels));
+fetch('/api/channels').then(r=>r.json()).then(c=>{
+  chGz.checked=c.channels.gz_topic; chFile.checked=c.channels.file;
+  chUdp.checked=c.channels.udp; chTcp.checked=c.channels.tcp; chSerial.checked=c.channels.serial;
+  udpHost.value=c.udp.host; udpPort.value=c.udp.port;
+  tcpHost.value=c.tcp.host; tcpPort.value=c.tcp.port;
+  serPort.value=c.serial.port; serBaud.value=c.serial.baud;
+});
 </script>
 </body>
 </html>
@@ -1530,17 +1650,48 @@ def trigger_paint(reason: str, pulse_ms: int = PAINT_PULSE_MS_DEFAULT) -> dict:
         "color": (40, 80, 240),
     })
     del paint_overlay_marks[32:]
-    try:
-        msg = Int32()
-        msg.data = int(pulse_ms)
-        paint_pub.publish(msg)
-    except Exception as exc:
-        record["topic_err"] = str(exc)
-    try:
-        with open(PAINT_SIGNAL_FILE, "a") as f:
-            f.write(f"{record['time']} {paint_count} {pulse_ms} {actual_pan_deg:.3f} {actual_tilt_deg:.3f} {selected_name or '-'}\n")
-    except Exception as exc:
-        record["file_err"] = str(exc)
+    payload_line = (f"{record['time']} {paint_count} {pulse_ms} "
+                    f"{actual_pan_deg:.3f} {actual_tilt_deg:.3f} "
+                    f"{selected_name or '-'}\n")
+    payload_bytes = payload_line.encode()
+    if paint_channels.get("gz_topic"):
+        try:
+            msg = Int32()
+            msg.data = int(pulse_ms)
+            paint_pub.publish(msg)
+        except Exception as exc:
+            record["topic_err"] = str(exc)
+    if paint_channels.get("file"):
+        try:
+            with open(PAINT_SIGNAL_FILE, "a") as f:
+                f.write(payload_line)
+        except Exception as exc:
+            record["file_err"] = str(exc)
+    if paint_channels.get("udp"):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.5)
+            s.sendto(payload_bytes, paint_udp_addr)
+            s.close()
+        except Exception as exc:
+            record["udp_err"] = str(exc)
+    if paint_channels.get("tcp"):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            s.connect(paint_tcp_addr)
+            s.sendall(payload_bytes)
+            s.close()
+        except Exception as exc:
+            record["tcp_err"] = str(exc)
+    if paint_channels.get("serial"):
+        try:
+            import serial as _ser  # type: ignore
+            with _ser.Serial(paint_serial_port, paint_serial_baud,
+                             timeout=0.3, write_timeout=0.3) as port:
+                port.write(payload_bytes)
+        except Exception as exc:
+            record["serial_err"] = str(exc)
     return record
 
 
@@ -1579,6 +1730,228 @@ def api_paint_auto():
         paint_auto_min_centered = max(5, min(600, int(data["min_centered"])))
     return jsonify({"ok": True, "paint_auto": paint_auto,
                     "min_centered": paint_auto_min_centered})
+
+
+@app.get("/api/channels")
+def api_channels_get():
+    return jsonify({
+        "channels": dict(paint_channels),
+        "udp": {"host": paint_udp_addr[0], "port": paint_udp_addr[1]},
+        "tcp": {"host": paint_tcp_addr[0], "port": paint_tcp_addr[1]},
+        "serial": {"port": paint_serial_port, "baud": paint_serial_baud},
+    })
+
+
+@app.post("/api/channels")
+def api_channels_set():
+    global paint_udp_addr, paint_tcp_addr, paint_serial_port, paint_serial_baud
+    data = request.get_json(force=True, silent=True) or {}
+    with lock:
+        if "channels" in data and isinstance(data["channels"], dict):
+            for k, v in data["channels"].items():
+                if k in paint_channels:
+                    paint_channels[k] = bool(v)
+        if "udp" in data:
+            paint_udp_addr = (
+                str(data["udp"].get("host", paint_udp_addr[0])),
+                safe_int(data["udp"], "port", paint_udp_addr[1], 1, 65535),
+            )
+        if "tcp" in data:
+            paint_tcp_addr = (
+                str(data["tcp"].get("host", paint_tcp_addr[0])),
+                safe_int(data["tcp"], "port", paint_tcp_addr[1], 1, 65535),
+            )
+        if "serial" in data:
+            paint_serial_port = str(data["serial"].get("port", paint_serial_port))
+            paint_serial_baud = safe_int(data["serial"], "baud",
+                                         paint_serial_baud, 300, 4_000_000)
+    return jsonify({"ok": True, "channels": dict(paint_channels)})
+
+
+def _ollama_list_models() -> list[str]:
+    try:
+        import urllib.request as _ur
+        r = _ur.urlopen(f"{OLLAMA_URL}/api/tags", timeout=2)
+        import json as _json
+        data = _json.loads(r.read())
+        return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+    except Exception:
+        return []
+
+
+def _agent_pick_default():
+    global agent_model
+    if agent_model:
+        return agent_model
+    models = _ollama_list_models()
+    if not models:
+        return None
+    # Prefer small, fast models for tool-call use.
+    pref = ("llama3.2", "llama3.1", "qwen2.5", "phi3", "mistral", "gemma")
+    for p in pref:
+        for m in models:
+            if p in m.lower():
+                agent_model = m
+                return m
+    agent_model = models[0]
+    return agent_model
+
+
+def _agent_execute(action: str, payload: dict | None = None) -> str:
+    global mode, sweep_enabled, paint_auto
+    payload = payload or {}
+    a = action.lower()
+    with lock:
+        if a == "paint":
+            rec = trigger_paint("agent", PAINT_PULSE_MS_DEFAULT)
+            return f"painted #{rec['n']}"
+        if a == "home":
+            mode = "home"; return "mode=home"
+        if a == "stop":
+            mode = "stop"; clear_selection(); return "mode=stop"
+        if a in ("track_on", "tracking_on"):
+            mode = "auto"; return "tracking on"
+        if a in ("track_off", "tracking_off"):
+            mode = "manual"; return "tracking off"
+        if a in ("sweep_on", "serial_on"):
+            sweep_enabled = True; return "auto serial tracker on"
+        if a in ("sweep_off", "serial_off"):
+            sweep_enabled = False; return "auto serial tracker off"
+        if a == "auto_paint_on":
+            paint_auto = True; return "auto paint on"
+        if a == "auto_paint_off":
+            paint_auto = False; return "auto paint off"
+        if a == "clear":
+            clear_selection(); return "selection cleared"
+        if a in ("select_name", "select"):
+            name = str(payload.get("name", "")).strip()
+            if not name:
+                return "select_name needs a target name"
+            for d in (detections or recent_detections):
+                if d.name.lower() == name.lower():
+                    global selected_id, selected_name, selected_anchor_xy
+                    selected_id = d.det_id
+                    selected_name = d.name
+                    x1, y1, x2, y2 = d.bbox
+                    selected_anchor_xy = ((x1 + x2) / 2, (y1 + y2) / 2)
+                    mode = "auto"
+                    return f"selected {d.name}"
+            return f"no detection matches '{name}'"
+    return f"unknown action '{action}'"
+
+
+def _agent_parse(reply: str) -> tuple[str | None, dict]:
+    import json as _json, re as _re
+    m = _re.search(r"\{[^{}]*\"action\"[^{}]*\}", reply)
+    if m:
+        try:
+            obj = _json.loads(m.group(0))
+            if isinstance(obj, dict) and "action" in obj:
+                action = str(obj.pop("action"))
+                return action, obj
+        except Exception:
+            pass
+    lower = reply.lower()
+    for kw in ("paint", "home", "stop", "track_on", "track_off",
+               "sweep_on", "sweep_off", "auto_paint_on", "auto_paint_off",
+               "clear"):
+        if kw in lower:
+            return kw, {}
+    return None, {}
+
+
+@app.get("/api/agent/models")
+def api_agent_models():
+    return jsonify({"models": _ollama_list_models(),
+                    "selected": agent_model,
+                    "enabled": agent_enabled,
+                    "status": agent_status,
+                    "url": OLLAMA_URL})
+
+
+@app.post("/api/agent/enable")
+def api_agent_enable():
+    global agent_enabled, agent_model, agent_status
+    data = request.get_json(force=True, silent=True) or {}
+    with lock:
+        if "enabled" in data:
+            agent_enabled = bool(data["enabled"])
+        if data.get("model"):
+            agent_model = str(data["model"])
+        if agent_enabled and agent_model is None:
+            _agent_pick_default()
+        agent_status = "ready" if agent_enabled and agent_model else "idle"
+    return jsonify({"ok": True, "enabled": agent_enabled,
+                    "model": agent_model, "status": agent_status})
+
+
+@app.post("/api/agent/chat")
+def api_agent_chat():
+    global agent_status
+    data = request.get_json(force=True, silent=True) or {}
+    text = str(data.get("message", "")).strip()
+    if not text:
+        return jsonify({"ok": False, "error": "empty message"})
+    if not agent_enabled:
+        return jsonify({"ok": False, "error": "agent disabled"})
+    model = agent_model or _agent_pick_default()
+    if not model:
+        return jsonify({"ok": False, "error": "no ollama model available"})
+
+    sys_prompt = (
+        "You are MANTIS, a turret-controller assistant for a Gazebo simulation. "
+        "Detected targets (names) and current pan/tilt are in the user's "
+        "context. Respond briefly. To act, emit a JSON object on its own line "
+        "like {\"action\": \"paint\"} or {\"action\": \"select_name\", "
+        "\"name\": \"car\"}. Allowed actions: paint, home, stop, track_on, "
+        "track_off, sweep_on, sweep_off, auto_paint_on, auto_paint_off, "
+        "select_name (with name), clear."
+    )
+    det_names = sorted({d.name for d in (detections or recent_detections)})
+    user_ctx = (
+        f"User message: {text}\n"
+        f"Current mode: {mode}. Tracking on: {mode == 'auto'}. "
+        f"Sweep: {sweep_enabled}. AutoPaint: {paint_auto}. "
+        f"Pan: {actual_pan_deg:.1f} deg. Tilt: {actual_tilt_deg:.1f} deg. "
+        f"Detected: {', '.join(det_names) or 'none'}."
+    )
+    try:
+        import urllib.request as _ur, json as _json
+        body = _json.dumps({
+            "model": model,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_ctx},
+            ],
+        }).encode()
+        req = _ur.Request(f"{OLLAMA_URL}/api/chat", data=body,
+                          headers={"Content-Type": "application/json"})
+        agent_status = "thinking"
+        r = _ur.urlopen(req, timeout=30)
+        agent_status = "ready"
+        resp = _json.loads(r.read())
+        reply = resp.get("message", {}).get("content", "")
+    except Exception as exc:
+        agent_status = f"err: {exc}"
+        return jsonify({"ok": False, "error": str(exc)})
+
+    action, payload_args = _agent_parse(reply)
+    action_result = ""
+    if action:
+        action_result = _agent_execute(action, payload_args)
+    entry = {"time": round(time.time(), 3), "user": text, "reply": reply,
+             "action": action, "action_result": action_result}
+    with lock:
+        agent_chat_log.insert(0, entry)
+        del agent_chat_log[64:]
+    return jsonify({"ok": True, "reply": reply, "action": action,
+                    "action_result": action_result, "model": model})
+
+
+@app.get("/api/agent/log")
+def api_agent_log():
+    return jsonify({"log": agent_chat_log[:32]})
 
 
 @app.post("/api/click_target")
@@ -1653,4 +2026,26 @@ def add_no_cache_headers(response):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5055, debug=False, threaded=True)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--headless", action="store_true",
+                    help="run control loop only, do not serve Web UI")
+    ap.add_argument("--auto", action="store_true",
+                    help="start with Auto Serial Tracker enabled "
+                    "(autonomous painting on boot)")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=5055)
+    args = ap.parse_args()
+    if args.auto:
+        sweep_enabled = True
+        paint_auto = True
+        mode = "auto"
+    if args.headless:
+        print("[mantis] headless mode — control loop only, no Web UI",
+              flush=True)
+        try:
+            while True:
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            pass
+    else:
+        app.run(host=args.host, port=args.port, debug=False, threaded=True)

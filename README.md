@@ -74,44 +74,45 @@ So the controller does not chase a pixel — it chases a *tracked object*. If th
 
 ```mermaid
 flowchart LR
-  GZ[Gazebo Harmonic\nworld + sensors] -- /mantis/nose_camera/image --> CAM
-  GZ -- /mantis/joint_states --> JS
+  GZ["Gazebo Harmonic<br/>world + sensors"]
+  GZ -- "nose_camera/image" --> CAM
+  GZ -- "joint_states" --> JS
 
-  subgraph WEBAPP[web_app.py]
-    CAM[image_to_bgr] --> DETW[detection_worker thread]
-    DETW -- HSV / YOLO+ByteTrack --> DETS[(detections list)]
-    CAM --> CT[control_tick]
-    DETS --> AUTO[auto_control_step]
+  subgraph WEBAPP["web_app.py"]
+    CAM["image_to_bgr"] --> DETW["detection_worker thread"]
+    DETW -- "HSV or YOLO+ByteTrack" --> DETS[("detections")]
+    CAM --> CT["control_tick"]
+    DETS --> AUTO["auto_control_step"]
     JS --> AUTO
     CT --> AUTO
-    CT --> MAN[manual_control_step]
-    CT --> HOME[home_control_step]
-    AUTO --> PUB[publish pan/tilt cmd]
-    AUTO --> PAINT[trigger_paint]
+    CT --> MAN["manual_control_step"]
+    CT --> HOME["home_control_step"]
+    AUTO --> PUB["publish pan/tilt cmd"]
+    AUTO --> PAINTNODE["trigger_paint"]
   end
 
-  PUB -- gz.msgs.Double --> GZ
-  PAINT -- gz.msgs.Int32 --> EXT[Pi / MCU\nGPIO + PWM]
-  PAINT -- file write --> SIG[/tmp/mantis_paint.signal]
-  WEBAPP -- Flask HTTP --> BROWSER[Browser UI]
-  BROWSER -- /api/select, /api/mode,\n/api/gains, /api/paint, ... --> WEBAPP
+  PUB -- "gz.msgs.Double" --> GZ
+  PAINTNODE -- "gz.msgs.Int32" --> EXT["Pi / MCU GPIO + PWM"]
+  PAINTNODE -- "file write" --> SIG["mantis_paint.signal"]
+  WEBAPP -- "Flask HTTP" --> BROWSER["Browser UI"]
+  BROWSER -- "REST API" --> WEBAPP
 ```
 
 ## Control loop
 
 ```mermaid
 flowchart TB
-  A[bbox center cx, cy] --> B[EMA smooth β=0.20]
-  B --> C[normalize nx, ny in -1..1]
-  C --> D{inside deadband?}
-  D -- yes --> E[freeze cmd toward actual,\ndecay integral]
-  D -- no --> F[θ = atan tan FOV/2 · n in degrees]
-  F --> G[PID: Kp·θ + Ki·∫θ dt + Kd·dθ/dt]
-  JS2[actual_pan_deg from joint_states] --> H
-  G --> H[desired = actual + sign · u]
-  H --> I[step = clamp desired - cmd within ±max_rate · dt]
-  I --> J[cmd += lpf · step]
-  J --> K[publish radians on /mantis/pan_cmd]
+  A["bbox center cx, cy"] --> B["EMA smooth (beta = 0.20)"]
+  B --> C["normalize to nx, ny in [-1, 1]"]
+  C --> D{"inside deadband?"}
+  D -- "yes" --> E["freeze cmd toward actual, decay integral"]
+  D -- "no" --> F["theta = atan(tan(FOV/2) * n)"]
+  F --> G["PID = Kp*theta + Ki*sum + Kd*derivative"]
+  JS2["actual joint angle"] --> H
+  G --> H["desired = actual + sign * u"]
+  H --> I["step = clamp(desired - cmd, +/- max_rate*dt)"]
+  I --> J["cmd += lpf * step"]
+  J --> K["publish radians on pan_cmd"]
 ```
 
 ## Run
