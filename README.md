@@ -1,23 +1,54 @@
 # MANTIS PAINTER
 
-Realtime persistent tracking with precision pan/tilt control. Gazebo Harmonic simulation built on top of a Blender-derived MANTIS chassis. Educational scope only — no projectile physics, no real-world deployment instructions. Paint events are virtual signals (gz topic + file) so an external Raspberry Pi or MCU can react over PWM / GPIO if wired.
+Realtime persistent tracking with precision pan/tilt control.
+Gazebo Harmonic simulation on top of a Blender-derived MANTIS chassis,
+plus a webcam path for laptop-only testing on macOS / Linux.
+Paint events are virtual signals (gz topic + file + UDP/TCP/serial)
+so an external Pi / ESP32 / Arduino can react over PWM / GPIO if wired.
 
-![nose camera view with object detections, track IDs, crosshair and live PID values](docs/assets/nose_camera.jpg)
+![nose camera view with object detections, track IDs, crosshair and live PID values](docs/assets/nose_camera_latest.jpg)
+
+### What's in this build
+
+- **Open-vocabulary detector** — switch between **YOLOv12n** (closed COCO-80, ~25 ms),
+  **YOLO-World v8s** (any text prompt, ~100 ms), or **HSV color** (~30 FPS on a Pi Zero).
+- **Sticky multi-stage resolver** — Pass-1 signature + Kalman + IoU gate;
+  Pass-2 same-name + adaptive spatial gate; Pass-3 cross-class anchor; ghost forward-fill;
+  long-lost re-acquire by HSV signature within 120 s.
+- **Auto Serial Tracker (Sweep painter)** — pick → center → hold 2 s → paint → mark
+  done → advance. Scans the camera between pan limits when no fresh target is in FOV
+  rather than re-locking the same just-painted object.
+- **Auto Zoom** — bbox area-fraction band keeps the locked target a usable size.
+- **Connect panel** (top-left, QGC / Mission Planner style) — pick frame source:
+  Gazebo sim **or** laptop webcam #0/1/2, plus **Auto Detect** that probes Gazebo first
+  then falls back to webcam. Paint signal channels (gz / file / UDP / TCP / serial)
+  configure host/port/baud in the same panel.
+- **30 m world ring** — 12 props (houses, bus, cabinet, pine tree, mailbox, fire hydrant,
+  traffic cones, standing person) at a 30 m radius around the MANTIS for full-FOV sweep testing.
 
 ### Dynamic tracking — pursuing moving cars
 
 ![Live nose-camera view with YOLOv12+ByteTrack: prius locked under the crosshair while a pickup, yellow ball, person and drone are also detected in-frame](docs/assets/nose_camera_dynamic.jpg)
 
-Crosshair is locked at the bbox center of the selected `car` (ID 5).
-ByteTrack keeps the ID stable while the prius and pickup drive around;
-the controller follows. Other detections (yellow ball ID 50, pickup
-ID 18, person, drone) are drawn but inactive.
+Crosshair locked on the selected `car`. ByteTrack keeps the ID stable while
+the prius and pickup drive opposite circles; the controller follows.
+Other detections are drawn but inactive.
 
-### Convergence trace — selecting a car, controller centers it
+### Persistent red [LOCKED] bbox
+
+![red bounding box labeled LOCKED on the selected target while other detections are drawn in default colours](docs/assets/locked_red_bbox.jpg)
+
+The resolver maintains identity across YOLO id flips. The red `[LOCKED]` outline
+is drawn on the same physical target throughout the lock — even if ByteTrack
+re-issues the underlying `det_id` after a brief drop.
+
+### Convergence trace — selecting a target, controller centers it
 
 ![pan and tilt cmd vs actual on top, normalized pixel error ex/ey on bottom](docs/assets/convergence.png)
 
-Top: blue = pan (cmd solid, actual dashed). Red = tilt (same). Bottom: normalized pixel error of the selected target's bbox center (`ex` horizontal, `ey` vertical). The dotted lines mark the deadband.
+Top: blue = pan (cmd solid, actual dashed). Red = tilt (same).
+Bottom: normalized pixel error of the selected target's bbox center
+(`ex` horizontal, `ey` vertical). Dotted lines mark the deadband.
 
 ## What kind of tracking is this?
 
@@ -37,12 +68,17 @@ Object-level tracking with a per-target identity stack — not blind pixel track
 ## Features
 
 ### Perception
-- Live `gz.msgs.Image` subscription on `/mantis/nose_camera/image` (1280×720, 30 Hz, HFOV 1.012 rad)
-- HSV color detector with 10+ named color classes
-- **YOLOv12n** detector via `ultralytics` (auto-downloaded on first launch)
-- **ByteTrack** multi-object tracker with persistent IDs
-- Async detection thread — heavy inference never blocks the Flask UI
-- Detection score filter (`MIN_TRACK_SCORE = 0.15`) to ignore weak hits
+- Pluggable **frame source**: `gz` subscriber on `/mantis/nose_camera/image`
+  (1280×720, 30 Hz, HFOV 1.012 rad) **or** `cv2.VideoCapture` on a laptop webcam.
+  Switch live via the Connect dropdown — same downstream pipeline.
+- HSV color detector with 10+ named color classes (fastest on edge devices).
+- **YOLOv12n** detector via `ultralytics` (auto-downloaded on first launch, ~25 ms / frame).
+- **YOLO-World v8s** open-vocabulary detector — types any class as text
+  (`car`, `red truck`, `drone`, `traffic cone`, ...). Uses CLIP-ViT-B/32
+  text embeddings. ~100 ms / frame.
+- **ByteTrack** multi-object tracker with persistent IDs across detectors.
+- Async detection thread — heavy inference never blocks the Flask UI.
+- Detection score filter (`MIN_TRACK_SCORE = 0.05`) to keep weak hits for ByteTrack to filter.
 
 ### Tracking
 - Real-`dt` PID (not fixed `CONTROL_HZ`)
@@ -56,17 +92,19 @@ Object-level tracking with a per-target identity stack — not blind pixel track
 ### Control modes
 | button | behaviour |
 |---|---|
-| `Tracking: ON/OFF` | toggle auto-tracking of the selected target |
-| `Auto Paint: ON/OFF` | fire one paint pulse whenever the selected target is centred and held. Stays on the same target |
-| `Auto Serial Tracker: ON/OFF` | fully autonomous loop: pick next un-painted target → centre → paint → advance. Remembers painted targets across sessions (`/tmp/mantis_painted_memory.json`). Independent of Tracking switch |
-| `Reset memory` | clear the painted-target memory |
-| `Manual / Jog pad / Arrow keys` | drive pan & tilt directly with step size 0.5°–10° |
+| `Tracking: ON/OFF` | ON = camera actively follows the locked target. OFF = freeze pan/tilt but **keep** the lock (never auto-clears or switches) |
+| `Auto Paint: ON/OFF` | one paint pulse whenever the selected target is centered + held. Stays on the same target |
+| `Auto Serial Tracker: ON/OFF` | autonomous loop: pick un-painted target → center 2 s → PAINT → mark its `det_id` done → advance. **Forces Tracking ON**. Scans the camera ±FOV when no fresh target is in view |
+| `Auto Zoom: ON/OFF` | when the locked target bbox area is too small/large for tracking, zoom in/out automatically (band: 1.2 %–18 % of frame) |
+| `Reset memory` | clear painted-id set |
+| `Manual / Jog pad / Arrow keys` | drive pan & tilt directly (step 0.5°–10°) |
 | `Home` | smooth return to `pan=0, tilt=12°` |
 | `STOP` | freeze cmd at current actual angles |
-| `Click-to-Aim` | clicks on the feed aim the camera at that pixel instead of selecting a bbox |
-| `PAINT` | one paint pulse on current target. Key `P` |
+| `Click-to-Aim` | click on the feed aims the camera at that pixel instead of selecting a bbox |
+| `PAINT` | one paint pulse on current target. Key `P` / `Space` |
 | `Auto-tune` | step-response FOPDT identification + Cohen-Coon → applies gains |
-| `zoom` slider | browser-side digital zoom 1×–4× on the live feed (clicks are corrected back to source coords) |
+| `zoom` slider / `Shift+↑/↓` | digital zoom 1×–4× on the live feed (anchor + KF remapped server-side) |
+| `Connect` (top-left) | **Auto Detect** (probes gz then webcam) / Gazebo / Laptop Webcam #0/1/2, plus paint signal channels + host/port/baud |
 
 ### Web UI
 - Live MJPEG feed at `http://127.0.0.1:5055`
@@ -129,19 +167,29 @@ flowchart TB
 
 ## Run
 
-Terminal 1:
+### Linux + Gazebo sim
+
 ```bash
-cd /home/sanju/MANTIS_PAINTER
-gz sim -v 3 worlds/mantis_robot_world.sdf
+./run.sh
+# launches Gazebo + Flask UI together. Opens http://127.0.0.1:5055
 ```
 
-Terminal 2:
+Click **Connect** (top-left) → **Auto Detect** to lock onto the sim camera + joint state.
+
+### macOS / Linux laptop — webcam-only, no sim
+
 ```bash
-cd /home/sanju/MANTIS_PAINTER
-/home/sanju/venv-ardupilot/bin/python3 web_app.py     # needs flask + gz python + ultralytics
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python3 web_app.py
 ```
 
-Open `http://127.0.0.1:5055`.
+Open http://127.0.0.1:5055 → **Connect** → **Laptop Webcam #0**.
+Tracker, sweep painter, paint signal, web UI all run on the laptop camera
+exactly the same as on the sim feed.
+
+See [INSTALL.md](INSTALL.md) for full dependency setup including the
+optional YOLO-World CLIP weights and webcam permissions.
 
 ## Important files
 
@@ -170,14 +218,27 @@ Joint limits (from Blender source):
 
 ## Keyboard
 
+Global shortcuts (always active, no toggle needed):
+
 | key | action |
 |---|---|
-| arrows / WASD | jog pan / tilt by selected step |
-| Space | Home |
-| T | toggle Tracking ON/OFF |
-| C | Clear target |
-| P | one paint pulse |
-| Esc / X | STOP |
+| `L` | lock the detection nearest the center crosshair |
+| `C` | Clear locked target |
+| `A` | switch to Auto (tracking) mode |
+| `S` | STOP (freeze pan/tilt) |
+| `H` | Home pose |
+| `K` | toggle Keyboard jog mode on/off |
+| `Esc` / `X` | STOP |
+| `P` / `Space` | one paint pulse |
+| `Shift+↑` / `Shift+↓` (or Ctrl+↑/↓) | zoom in / out |
+
+Jog (when Keyboard mode is ON):
+
+| key | action |
+|---|---|
+| `←` / `→` | pan jog by selected step |
+| `↑` / `↓` / `W` / `D` | tilt jog by selected step |
+| `T` | toggle Tracking ON/OFF |
 
 ## Verified tuning (current default gains)
 
@@ -194,14 +255,29 @@ The defaults committed to `web_app.py` were swept and chosen by
 | PID output clamp | 6° per cycle — single-frame outlier can't whiplash the joint |
 | LPF on cmd | 0.32, softened by 1/√zoom at high zoom |
 
-Measured performance:
+Measured performance (`scripts/multi_scene_test.py`, latest build):
 
-| metric | zoom 1.0× | zoom 2.0× |
-|---|---|---|
-| Lock time | 1.8 s | 2.5 s |
-| SS ex | +0.005 ± 0.004 | −0.018 ± 0.001 |
-| SS ey | +0.006 ± 0.006 | −0.019 ± 0.008 |
-| Overshoot | none | none |
+| scene | real-det frames | unique `selected_id`s | lock_t | SS ex | SS ey |
+|---|---|---|---|---|---|
+| S1 static | 32/32 | **1** | 3.75 s | +0.001 ± 0.038 | −0.008 ± 0.001 |
+| S2 dyn-car | 34/40 | **1** (one transient flip) | 2.5 s | +0.030 ± 0.017 | −0.009 ± 0.004 |
+| S3 multi (cars + people + balls) | 30/40 | **1** | 1.5 s | +0.005 ± 0.002 | −0.011 ± 0.003 |
+| S4 zoom-stress (1×→2.5×→1×) | 19/20 | 2 | 0.25 s | +0.001 ± 0.000 | −0.007 ± 0.001 |
+
+Lock identity stays on the SAME physical object across YOLO id flips, zoom
+transitions and sibling traffic. Pre-fix baseline had S2 unique=3 and S3
+never converging.
+
+YOLO-World vs YOLOv12n on the same harness:
+
+| detector | latency | S2 unique ids | S3 unique ids |
+|---|---|---|---|
+| YOLOv12n + ByteTrack | 25 ms | 1 | 1 |
+| YOLO-World v8s + ByteTrack | 100 ms | 3 | 4 |
+| YOLOE-11s-seg (CPU) | 380 ms | — (too slow for live track) | — |
+
+Verdict: keep YOLOv12 for known classes; switch to YOLO-World only when
+the target class is outside COCO-80.
 
 To re-tune for a different rig: run
 
@@ -300,16 +376,61 @@ while True: time.sleep(1)
 
 Wire the same way for ROS 2 with `ros_gz_bridge` if the rig speaks ROS.
 
+### Real-world rig — laptop + ESP32 + 2 servos
+
+For testing the tracker on hardware without a Pi or Jetson:
+
+```text
+USB webcam ──USB──► Laptop ──USB serial──► ESP32 ──PWM──► 2× servos (pan + tilt)
+                       │                       └──► 5 V/3 A buck (servo power, separate rail)
+                       └─ runs web_app.py
+                          (YOLO full speed on laptop CPU/GPU)
+```
+
+ESP32 sketch:
+
+```cpp
+#include <ESP32Servo.h>
+Servo pan, tilt;
+void setup(){
+  Serial.begin(115200);
+  pan.attach(18); tilt.attach(19);
+}
+void loop(){
+  if(Serial.available()){
+    String l = Serial.readStringUntil('\n');
+    int p = l.indexOf('P'), t = l.indexOf('T');
+    if(p>=0 && t>p){
+      float pa = l.substring(p+1,t).toFloat();
+      float ta = l.substring(t+1).toFloat();
+      pan.write(constrain(90 + (int)pa, 0, 180));
+      tilt.write(constrain(90 + (int)ta, 0, 180));
+    }
+  }
+}
+```
+
+Laptop side replaces the gz pan/tilt publisher with serial writes:
+
+```python
+import serial
+ser = serial.Serial("/dev/ttyUSB0", 115200)
+ser.write(f"P{pan_deg:+.2f}T{tilt_deg:+.2f}\n".encode())
+```
+
+Use the **Connect → Laptop Webcam #0** option for the frame source, set the
+**serial** paint channel in the Connect panel for the trigger.
+
 ### Headless / autonomous mode
 
-Drop the Web UI entirely and let the Pi run the loop:
+Drop the Web UI entirely:
 
 ```bash
 python3 web_app.py --headless --auto
 ```
 
-- `--headless`: no Flask, just the camera → detect → track → publish loop.
-- `--auto`: boots with **Auto Serial Tracker** + **Auto Paint** enabled, so the turret begins paint-marking detected targets without any user input.
+- `--headless`: no Flask, just camera → detect → track → publish loop.
+- `--auto`: boots with **Auto Serial Tracker** + **Auto Paint** enabled.
 
 ### Health endpoint for a hardware watchdog
 
