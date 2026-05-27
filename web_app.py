@@ -533,10 +533,12 @@ def safe_int(d: dict, key: str, default: int,
 
 
 GAIN_BOUNDS = {
-    "kp": (0.0, 3.0),
-    "ki": (0.0, 2.0),
+    # Kp > 1.0 overshoots the tilt axis on this rig — clamp here so a
+    # sticky slider or accidental drag can't induce vertical bobble.
+    "kp": (0.0, 1.0),
+    "ki": (0.0, 1.0),
     "kd": (0.0, 1.0),
-    "max_rate": (1.0, 200.0),
+    "max_rate": (1.0, 80.0),
     "deadband": (0.0, 0.20),
 }
 
@@ -1966,7 +1968,7 @@ HTML_PAGE = r"""
       </div>
 
       <div class="sect-head">Tracking tuning (slide to apply live)</div>
-      <div class="gain" title="how aggressively the camera chases the target"><span>Speed</span><input id="gKp" type="range" min="0.05" max="1.5" step="0.01" value="0.55"><span id="gKpV">0.55</span></div>
+      <div class="gain" title="how aggressively the camera chases the target. Above ~1.0 the tilt axis overshoots and you'll see vertical bobble."><span>Speed</span><input id="gKp" type="range" min="0.05" max="1.0" step="0.01" value="0.55"><span id="gKpV">0.55</span></div>
       <div class="gain" title="corrects steady-state offset so target ends up exactly centered"><span>Hold</span><input id="gKi" type="range" min="0.00" max="0.60" step="0.01" value="0.20"><span id="gKiV">0.20</span></div>
       <div class="gain" title="damping; higher = smoother but slower to settle"><span>Smooth</span><input id="gKd" type="range" min="0.00" max="0.30" step="0.005" value="0.04"><span id="gKdV">0.04</span></div>
       <div class="gain" title="max degrees per second the camera can slew"><span>Max slew</span><input id="gRate" type="range" min="5" max="80" step="1" value="25"><span id="gRateV">25</span></div>
