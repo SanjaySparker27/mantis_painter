@@ -46,7 +46,10 @@
     <link name="tilt_link">
       <pose>3.998708 -2.146332 3.529934 0 0 0</pose>
       <inertial>
-        <pose>3.0 0 0.6 0 0 0</pose>
+        <!-- CoM on the rotation axis so gravity creates no static torque
+             on tilt_joint. Otherwise the inner JointPositionController
+             needed >350 N·m just to hold position. -->
+        <pose>0 0 0 0 0 0</pose>
         <mass>12</mass>
         <inertia><ixx>15</ixx><iyy>30</iyy><izz>30</izz></inertia>
       </inertial>

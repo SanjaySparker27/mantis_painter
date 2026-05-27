@@ -948,24 +948,26 @@ target_moving = False
 
 
 def _moving_target_loop():
-    """Drive the orange-sphere moving_target on a sinusoidal +/- 4 m/s pattern
-    along world X. Toggled by /api/moving_target."""
+    """Yellow sphere bounces up and down in place. Tests dynamic tracking
+    against a small, predictable motion."""
     import math as _m
     t0 = time.time()
     while True:
         t = time.time() - t0
         msg = Twist()
         if target_moving:
-            msg.linear.x = 4.0 * _m.sin(0.4 * t)
-            msg.linear.y = 1.5 * _m.cos(0.3 * t)
+            msg.linear.x = 0.0
+            msg.linear.y = 0.0
+            msg.linear.z = 2.5 * _m.sin(2.0 * t)
         else:
             msg.linear.x = 0.0
             msg.linear.y = 0.0
+            msg.linear.z = 0.0
         try:
             moving_target_pub.publish(msg)
         except Exception:
             pass
-        time.sleep(0.05)
+        time.sleep(0.04)
 
 
 threading.Thread(target=_moving_target_loop, daemon=True).start()
@@ -1960,9 +1962,6 @@ def api_zoom():
         global last_target_w, last_target_h
         last_target_w *= ratio
         last_target_h *= ratio
-        # Reset PID memory and sync cmd to actual — the new zoom abruptly
-        # changes pixel-error scale, so any cmd that was "ahead" of actual
-        # would now correspond to a wildly different desired angle.
         pan_i_deg = 0.0
         tilt_i_deg = 0.0
         last_ex_norm = 0.0
@@ -1972,6 +1971,13 @@ def api_zoom():
             pan_deg = actual_pan_deg
             tilt_deg = actual_tilt_deg
         zoom_factor = new_z
+        # ByteTrack IDs almost never survive a sudden zoom change because
+        # the input image content jumps. Drop the stale ID and let the
+        # next frame's resolver bind to whatever detection is nearest to
+        # the remapped anchor — the actual physical target.
+        global selected_id
+        if selected_id is not None and detector_mode == "auto":
+            selected_id = None
     return jsonify({"ok": True, "zoom": zoom_factor})
 
 

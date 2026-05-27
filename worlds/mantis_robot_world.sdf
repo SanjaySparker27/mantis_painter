@@ -150,13 +150,12 @@
          track via the built-in TrajectoryFollower plugin. Tests dynamic
          tracking — the controller has to chase a moving object. -->
     <model name="moving_target">
-      <pose>10 -2 1.0 0 0 0</pose>
+      <pose>18 -2 2.0 0 0 0</pose>
       <link name="link">
-        <inertial><mass>3</mass><inertia><ixx>0.3</ixx><iyy>0.3</iyy><izz>0.3</izz></inertia></inertial>
-        <collision name="c"><geometry><sphere><radius>0.6</radius></sphere></geometry></collision>
+        <inertial><mass>2</mass><inertia><ixx>0.2</ixx><iyy>0.2</iyy><izz>0.2</izz></inertia></inertial>
         <visual name="v">
-          <geometry><sphere><radius>0.6</radius></sphere></geometry>
-          <material><ambient>0.95 0.42 0.05 1</ambient><diffuse>0.98 0.50 0.08 1</diffuse></material>
+          <geometry><sphere><radius>0.7</radius></sphere></geometry>
+          <material><ambient>0.98 0.90 0.10 1</ambient><diffuse>0.99 0.95 0.18 1</diffuse></material>
         </visual>
       </link>
       <plugin filename="gz-sim-velocity-control-system" name="gz::sim::systems::VelocityControl">
