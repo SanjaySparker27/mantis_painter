@@ -28,6 +28,7 @@ from gz.msgs10.double_pb2 import Double
 from gz.msgs10.image_pb2 import Image
 from gz.msgs10.int32_pb2 import Int32
 from gz.msgs10.model_pb2 import Model
+from gz.msgs10.twist_pb2 import Twist
 
 
 app = Flask(__name__)
@@ -112,6 +113,7 @@ node = gz_transport.Node()
 pan_pub = node.advertise(PAN_TOPIC, Double)
 tilt_pub = node.advertise(TILT_TOPIC, Double)
 paint_pub = node.advertise(PAINT_TOPIC, Int32)
+moving_target_pub = node.advertise("/moving_target/cmd_vel", Twist)
 
 latest_raw: np.ndarray | None = None
 latest_annotated: bytes | None = None
@@ -153,6 +155,10 @@ detector_mode = "auto"  # auto = prefer YOLO+ByteTrack, color = force color
 yolo_status = "init"
 last_command_pan_deg = 0.0
 last_command_tilt_deg = 12.0
+zoom_factor = 1.0  # 1.0 = full FOV; >1 = digital zoom (crop+resize, narrower FOV)
+ZOOM_MIN = 1.0
+ZOOM_MAX = 6.0
+
 paint_count = 0
 paint_last_ts = 0.0
 paint_auto = False
@@ -331,6 +337,30 @@ def publish_angle(pub, deg: float) -> None:
 def publish_pan_tilt() -> None:
     publish_angle(pan_pub, pan_deg)
     publish_angle(tilt_pub, tilt_deg)
+
+
+def apply_digital_zoom(frame: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """Crop the central region of the frame by `zoom_factor`, resize back to
+    the original size, and return the (zoomed_frame, eff_hfov, eff_vfov).
+    Detection + controller use the returned frame, so the system effectively
+    has narrower FOV but higher pixel-per-degree at the cost of peripheral
+    coverage.
+    """
+    z = clamp(zoom_factor, ZOOM_MIN, ZOOM_MAX)
+    if z <= 1.001:
+        return frame, HFOV_RAD, VFOV_RAD
+    h, w = frame.shape[:2]
+    cw = max(8, int(w / z))
+    ch = max(8, int(h / z))
+    x0 = (w - cw) // 2
+    y0 = (h - ch) // 2
+    crop = frame[y0:y0 + ch, x0:x0 + cw]
+    zoomed = cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR)
+    return zoomed, HFOV_RAD / z, VFOV_RAD / z
+
+
+_eff_hfov = HFOV_RAD
+_eff_vfov = VFOV_RAD
 
 
 def image_to_bgr(msg: Image) -> np.ndarray | None:
@@ -596,8 +626,8 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     ex_eff = 0.0 if in_deadband_x else nx
     ey_eff = 0.0 if in_deadband_y else ny
 
-    pan_err_deg = pixel_norm_to_angle_deg(ex_eff, HFOV_RAD)
-    tilt_err_deg = pixel_norm_to_angle_deg(ey_eff, VFOV_RAD)
+    pan_err_deg = pixel_norm_to_angle_deg(ex_eff, _eff_hfov)
+    tilt_err_deg = pixel_norm_to_angle_deg(ey_eff, _eff_vfov)
 
     pan_i_deg = clamp(pan_i_deg + pan_err_deg * dt,
                       -pan_gains.integral_clamp_deg, pan_gains.integral_clamp_deg)
@@ -835,15 +865,17 @@ def detection_worker(frame: np.ndarray) -> None:
 
 def on_image(msg: Image) -> None:
     global latest_raw, latest_annotated, latest_stamp, frame_count
-    global _detection_thread_busy
-    frame = image_to_bgr(msg)
-    if frame is None:
+    global _detection_thread_busy, _eff_hfov, _eff_vfov
+    raw = image_to_bgr(msg)
+    if raw is None:
         return
-    # Hold lock only for state mutations (control_tick + read of detections
-    # for draw_overlay). Encoding is done outside the lock so /api/status,
-    # /video_feed and the detection worker don't queue behind it.
+    # Apply digital zoom BEFORE detection + drawing. Detector and controller
+    # therefore both see the zoomed-in view; effective FOV scales with zoom.
+    frame, eff_h, eff_v = apply_digital_zoom(raw)
     with lock:
         latest_raw = frame
+        _eff_hfov = eff_h
+        _eff_vfov = eff_v
         control_tick(frame.shape[1], frame.shape[0])
         annotated = draw_overlay(frame)
         latest_stamp = time.time()
@@ -877,6 +909,33 @@ def on_joint_state(msg: Model) -> None:
             actual_tilt_deg = math.degrees(j.axis1.position)
             tilt_vel_deg_s = math.degrees(j.axis1.velocity)
     joint_state_stamp = time.time()
+
+
+target_moving = False
+
+
+def _moving_target_loop():
+    """Drive the orange-sphere moving_target on a sinusoidal +/- 4 m/s pattern
+    along world X. Toggled by /api/moving_target."""
+    import math as _m
+    t0 = time.time()
+    while True:
+        t = time.time() - t0
+        msg = Twist()
+        if target_moving:
+            msg.linear.x = 4.0 * _m.sin(0.4 * t)
+            msg.linear.y = 1.5 * _m.cos(0.3 * t)
+        else:
+            msg.linear.x = 0.0
+            msg.linear.y = 0.0
+        try:
+            moving_target_pub.publish(msg)
+        except Exception:
+            pass
+        time.sleep(0.05)
+
+
+threading.Thread(target=_moving_target_loop, daemon=True).start()
 
 
 def camera_thread() -> None:
@@ -925,7 +984,7 @@ HTML_PAGE = r"""
     section{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
     .title{height:38px;display:flex;align-items:center;justify-content:space-between;padding:0 12px;border-bottom:1px solid var(--line);color:var(--muted);font-size:13px}
     #feedWrap{position:relative;overflow:hidden;background:#050607;aspect-ratio:16/9;cursor:crosshair}
-    #feed{width:100%;aspect-ratio:16/9;display:block;background:#050607;cursor:crosshair;transform-origin:center center;transition:transform .12s ease-out}
+    #feed{width:100%;aspect-ratio:16/9;display:block;background:#050607;cursor:crosshair}
     .stats{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;padding:10px}
     .stat{border:1px solid var(--line);border-radius:6px;padding:10px;min-height:62px}
     .label{color:var(--muted);font-size:12px}
@@ -985,6 +1044,7 @@ HTML_PAGE = r"""
         <button id="bPaintAuto" title="auto-fire paint when selected target stays centered (stays on the SAME target)">Auto Paint: OFF</button>
         <button id="bSweep" title="full autonomous loop: pick → center → paint → NEXT target. Remembers painted targets across sessions.">Auto Serial Tracker: OFF</button>
         <button id="bSweepReset" title="forget painted memory">Reset memory</button>
+        <button id="bMoveTgt" title="move the orange ball back-and-forth so you can test dynamic tracking">Move target: OFF</button>
       </div>
 
       <div class="sect-head">Detector + Tracker</div>
@@ -1120,6 +1180,13 @@ bSweep.onclick=async ()=>{
 bSweepReset.onclick=async ()=>{
   await fetch('/api/sweep',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_painted:true})});
 };
+let moveTgtOn=false;
+bMoveTgt.onclick=async ()=>{
+  moveTgtOn=!moveTgtOn;
+  bMoveTgt.textContent='Move target: '+(moveTgtOn?'ON':'OFF');
+  bMoveTgt.classList.toggle('active',moveTgtOn);
+  await fetch('/api/moving_target',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:moveTgtOn})});
+};
 document.addEventListener('keypress',e=>{
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return;
   if(e.key==='p'||e.key==='P'){ bPaint.click(); }
@@ -1136,10 +1203,14 @@ dColor.onclick=()=>setDetector('color');
 let clickAim=false;
 let zoomVal=1.0;
 const zoomEl=document.getElementById('zoom'),zoomLbl=document.getElementById('zoomV');
+let zoomPostTimer=null;
 function applyZoom(){
   zoomVal=parseFloat(zoomEl.value);
-  feed.style.transform='scale('+zoomVal+')';
   zoomLbl.textContent=zoomVal.toFixed(1)+'x';
+  clearTimeout(zoomPostTimer);
+  zoomPostTimer=setTimeout(()=>{
+    fetch('/api/zoom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({zoom:zoomVal})});
+  },80);
 }
 zoomEl.addEventListener('input',applyZoom);
 applyZoom();
@@ -1150,14 +1221,10 @@ bClickAim.onclick=()=>{
 };
 feed.addEventListener('click', async e=>{
   const r=feed.getBoundingClientRect();
-  // bounding rect already reflects CSS transform; convert click back to
-  // original 1280x720 frame coordinates by un-scaling around center.
-  const w=r.width, h=r.height;
-  const cxScreen=r.left + w/2, cyScreen=r.top + h/2;
-  const dx=(e.clientX - cxScreen)/zoomVal;
-  const dy=(e.clientY - cyScreen)/zoomVal;
-  const x=(w/2 + dx)/w * 1280;
-  const y=(h/2 + dy)/h * 720;
+  // Server zooms before delivering JPG, so the displayed pixel coords ARE
+  // the zoomed-frame coords. Direct map to 1280x720.
+  const x=(e.clientX-r.left)/r.width*1280;
+  const y=(e.clientY-r.top)/r.height*720;
   const url=clickAim?'/api/click_target':'/api/select';
   await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x,y})});
 });
@@ -1418,6 +1485,9 @@ def api_status():
             "detection_latency_ms": int(_detection_last_latency_s * 1000),
             "detection_age_s": (time.time() - _detection_last_completed)
                                if _detection_last_completed else None,
+            "zoom": zoom_factor,
+            "eff_hfov_deg": math.degrees(_eff_hfov),
+            "eff_vfov_deg": math.degrees(_eff_vfov),
             "paint_count": paint_count,
             "paint_auto": paint_auto,
             "sweep_enabled": sweep_enabled,
@@ -1809,6 +1879,25 @@ def api_paint_auto():
                     "min_centered": paint_auto_min_centered})
 
 
+@app.post("/api/moving_target")
+def api_moving_target():
+    global target_moving
+    data = request.get_json(force=True, silent=True) or {}
+    if "enabled" in data:
+        target_moving = bool(data["enabled"])
+    return jsonify({"ok": True, "moving": target_moving})
+
+
+@app.post("/api/zoom")
+def api_zoom():
+    global zoom_factor
+    data = request.get_json(force=True, silent=True) or {}
+    z = safe_float(data, "zoom", zoom_factor, ZOOM_MIN, ZOOM_MAX)
+    with lock:
+        zoom_factor = z
+    return jsonify({"ok": True, "zoom": zoom_factor})
+
+
 @app.get("/api/channels")
 def api_channels_get():
     return jsonify({
@@ -1915,6 +2004,40 @@ def _agent_execute(action: str, payload: dict | None = None) -> str:
                     return f"selected {d.name}"
             return f"no detection matches '{name}'"
     return f"unknown action '{action}'"
+
+
+ACTION_INTENT_WORDS = {
+    "paint": {"paint", "shoot", "fire", "mark", "spray", "trigger", "tag"},
+    "home": {"home", "reset", "center", "neutral", "default", "park"},
+    "stop": {"stop", "halt", "freeze", "pause", "abort", "hold"},
+    "track_on": {"track", "tracking", "follow", "chase", "lock"},
+    "tracking_on": {"track", "tracking", "follow", "chase", "lock"},
+    "track_off": {"stop tracking", "untrack", "release", "off"},
+    "tracking_off": {"stop tracking", "untrack", "release", "off"},
+    "sweep_on": {"sweep", "serial", "all", "scan", "every"},
+    "sweep_off": {"sweep", "off", "stop sweep", "stop scan"},
+    "serial_on": {"sweep", "serial", "all", "scan"},
+    "serial_off": {"stop", "off"},
+    "auto_paint_on": {"auto", "automatic", "paint"},
+    "auto_paint_off": {"manual", "stop auto", "off"},
+    "select_name": {"select", "pick", "target", "aim", "choose", "switch"},
+    "select": {"select", "pick", "target", "aim", "choose", "switch"},
+    "clear": {"clear", "drop", "forget", "deselect", "unselect", "remove"},
+}
+
+
+def _user_wants_action(user_text: str, action: str) -> bool:
+    t = user_text.lower()
+    # Trivial greetings
+    if t.strip() in {"hi", "hello", "hey", "yo", "ok", "okay", "thanks", "thx",
+                     "thank you", "bye", "?"}:
+        return False
+    # Questions usually want info, not action — unless they explicitly include
+    # an imperative word.
+    keywords = ACTION_INTENT_WORDS.get(action.lower(), set())
+    has_kw = any(k in t for k in keywords)
+    # Allow action if user used one of its intent words.
+    return has_kw
 
 
 VALID_ACTIONS = {
@@ -2036,6 +2159,12 @@ def api_agent_chat():
 
     action, payload_args = _agent_parse(reply)
     action_result = ""
+    # Sanity check: don't execute an action if the USER message doesn't look
+    # like an action request. Small models love to invent JSON tool calls in
+    # response to greetings or factual questions.
+    if action and not _user_wants_action(text, action):
+        action_result = "(skipped — message looked conversational)"
+        action = None
     if action:
         action_result = _agent_execute(action, payload_args)
     entry = {"time": round(time.time(), 3), "user": text, "reply": reply,
