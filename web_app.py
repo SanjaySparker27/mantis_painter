@@ -671,19 +671,35 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     tilt_i_deg = clamp(tilt_i_deg + tilt_err_deg * dt,
                        -tilt_gains.integral_clamp_deg, tilt_gains.integral_clamp_deg)
 
-    last_pan_err_deg = pixel_norm_to_angle_deg(last_ex_norm, HFOV_RAD)
-    last_tilt_err_deg = pixel_norm_to_angle_deg(last_ey_norm, VFOV_RAD)
-    pan_derr_per_s = (pan_err_deg - last_pan_err_deg) / dt
-    tilt_derr_per_s = (tilt_err_deg - last_tilt_err_deg) / dt
+    # BUG-FIX: previously this used HFOV_RAD/VFOV_RAD (wide-angle constants)
+    # while pan_err_deg used _eff_hfov (narrow). At zoom 2x the same nx
+    # produced 2x larger pan_err_deg, so the derivative spiked to a
+    # gigantic value that whiplashed the controller in the wrong sign.
+    last_pan_err_deg = pixel_norm_to_angle_deg(last_ex_norm, _eff_hfov)
+    last_tilt_err_deg = pixel_norm_to_angle_deg(last_ey_norm, _eff_vfov)
+    # Belt-and-suspenders: clamp the derivative term to a sane range so a
+    # one-frame bbox jump can't dominate the loop.
+    DERIV_CLAMP_DEG_S = 60.0
+    pan_derr_per_s = clamp((pan_err_deg - last_pan_err_deg) / dt,
+                           -DERIV_CLAMP_DEG_S, DERIV_CLAMP_DEG_S)
+    tilt_derr_per_s = clamp((tilt_err_deg - last_tilt_err_deg) / dt,
+                            -DERIV_CLAMP_DEG_S, DERIV_CLAMP_DEG_S)
     last_ex_norm = nx
     last_ey_norm = ny
 
-    pan_u_deg = (pan_gains.kp * pan_err_deg
-                 + pan_gains.ki * pan_i_deg
-                 + pan_gains.kd * pan_derr_per_s)
-    tilt_u_deg = (tilt_gains.kp * tilt_err_deg
-                  + tilt_gains.ki * tilt_i_deg
-                  + tilt_gains.kd * tilt_derr_per_s)
+    PID_OUT_CLAMP_DEG = 6.0
+    pan_u_deg = clamp(
+        pan_gains.kp * pan_err_deg
+        + pan_gains.ki * pan_i_deg
+        + pan_gains.kd * pan_derr_per_s,
+        -PID_OUT_CLAMP_DEG, PID_OUT_CLAMP_DEG,
+    )
+    tilt_u_deg = clamp(
+        tilt_gains.kp * tilt_err_deg
+        + tilt_gains.ki * tilt_i_deg
+        + tilt_gains.kd * tilt_derr_per_s,
+        -PID_OUT_CLAMP_DEG, PID_OUT_CLAMP_DEG,
+    )
 
     # Visual servoing: desired joint angle = actual joint angle + correction
     # derived from image error. Ki accumulates against any inner-PID bias so
