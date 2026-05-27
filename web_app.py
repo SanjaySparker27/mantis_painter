@@ -473,8 +473,9 @@ def _bytetrack_reset() -> None:
         pass
 
 
-MAX_ANCHOR_REASSOC_PX = 180.0
-MAX_ANCHOR_REASSOC_CROSS_CLASS_PX = 140.0
+MAX_ANCHOR_REASSOC_PX = 110.0           # tightened so a sibling car can't steal
+MAX_ANCHOR_REASSOC_CROSS_CLASS_PX = 70.0
+BBOX_SIZE_RATIO_TOL = 0.60              # candidate bbox must be similar size to last seen
 MIN_TRACK_SCORE = 0.10  # lower so Gazebo renders with weak YOLO confidence still track
 
 
@@ -483,6 +484,19 @@ def _nearest_to_anchor(cands, ax, ay):
         ((d.bbox[0] + d.bbox[2]) / 2 - ax) ** 2
         + ((d.bbox[1] + d.bbox[3]) / 2 - ay) ** 2
     ))
+
+
+def _bbox_size_similar(d) -> bool:
+    """True if candidate bbox is within BBOX_SIZE_RATIO_TOL of last seen
+    bbox size. Stops a small/large nearby detection from being accepted
+    as our target when the real target just briefly dropped."""
+    w = float(d.bbox[2] - d.bbox[0])
+    h = float(d.bbox[3] - d.bbox[1])
+    if last_target_w <= 0 or last_target_h <= 0:
+        return True
+    wr = min(w, last_target_w) / max(w, last_target_w)
+    hr = min(h, last_target_h) / max(h, last_target_h)
+    return wr >= BBOX_SIZE_RATIO_TOL and hr >= BBOX_SIZE_RATIO_TOL
 
 
 def _ghost_target() -> Detection | None:
@@ -518,27 +532,30 @@ def resolve_selected_target() -> Detection | None:
         for d in strong:
             if d.det_id == selected_id:
                 return d
-        # ID lost: PREFER same-name + close to (anchor + predicted velocity).
-        # Velocity prediction matters a lot for fast movers — without it the
-        # sibling-vehicle just sitting at the OLD anchor location wins.
+        # ID lost: PREFER same-name + close to (anchor + predicted velocity)
+        # AND require bbox size similar to last-seen so we don't grab a tiny
+        # background sibling.
         if selected_anchor_xy and strong:
             ax_raw, ay_raw = selected_anchor_xy
             dt_lost = max(0.0, time.time() - last_target_seen_ts) if last_target_seen_ts else 0.0
             ax = ax_raw + target_vx_pix_s * dt_lost
             ay = ay_raw + target_vy_pix_s * dt_lost
             if selected_name is not None:
-                same_name = [d for d in strong if d.name == selected_name]
+                same_name = [d for d in strong if d.name == selected_name
+                             and _bbox_size_similar(d)]
                 if same_name:
                     best = _nearest_to_anchor(same_name, ax, ay)
                     bcx = (best.bbox[0] + best.bbox[2]) / 2
                     bcy = (best.bbox[1] + best.bbox[3]) / 2
                     if math.hypot(bcx - ax, bcy - ay) <= MAX_ANCHOR_REASSOC_PX:
                         return best
-            best = _nearest_to_anchor(strong, ax, ay)
-            bcx = (best.bbox[0] + best.bbox[2]) / 2
-            bcy = (best.bbox[1] + best.bbox[3]) / 2
-            if math.hypot(bcx - ax, bcy - ay) <= MAX_ANCHOR_REASSOC_CROSS_CLASS_PX:
-                return best
+            cross = [d for d in strong if _bbox_size_similar(d)]
+            if cross:
+                best = _nearest_to_anchor(cross, ax, ay)
+                bcx = (best.bbox[0] + best.bbox[2]) / 2
+                bcy = (best.bbox[1] + best.bbox[3]) / 2
+                if math.hypot(bcx - ax, bcy - ay) <= MAX_ANCHOR_REASSOC_CROSS_CLASS_PX:
+                    return best
         return _ghost_target()
 
     if selected_name is not None:
@@ -548,16 +565,20 @@ def resolve_selected_target() -> Detection | None:
     if not named:
         if selected_anchor_xy and strong:
             ax, ay = selected_anchor_xy
-            best = _nearest_to_anchor(strong, ax, ay)
-            bcx = (best.bbox[0] + best.bbox[2]) / 2
-            bcy = (best.bbox[1] + best.bbox[3]) / 2
-            if math.hypot(bcx - ax, bcy - ay) <= MAX_ANCHOR_REASSOC_CROSS_CLASS_PX:
-                return best
+            cross = [d for d in strong if _bbox_size_similar(d)]
+            if cross:
+                best = _nearest_to_anchor(cross, ax, ay)
+                bcx = (best.bbox[0] + best.bbox[2]) / 2
+                bcy = (best.bbox[1] + best.bbox[3]) / 2
+                if math.hypot(bcx - ax, bcy - ay) <= MAX_ANCHOR_REASSOC_CROSS_CLASS_PX:
+                    return best
         return _ghost_target()
     if selected_anchor_xy is None:
         return named[0] if len(named) == 1 else None
     ax, ay = selected_anchor_xy
-    best = _nearest_to_anchor(named, ax, ay)
+    sized = [d for d in named if _bbox_size_similar(d)]
+    pool = sized if sized else named
+    best = _nearest_to_anchor(pool, ax, ay)
     bcx = (best.bbox[0] + best.bbox[2]) / 2
     bcy = (best.bbox[1] + best.bbox[3]) / 2
     dist = math.hypot(bcx - ax, bcy - ay)
