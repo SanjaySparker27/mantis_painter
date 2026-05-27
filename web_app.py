@@ -119,6 +119,8 @@ paint_pub = node.advertise(PAINT_TOPIC, Int32)
 moving_target_pub = node.advertise("/moving_target/cmd_vel", Twist)
 car_prius_pub = node.advertise("/car_prius_front/cmd_vel", Twist)
 car_pickup_pub = node.advertise("/car_pickup_right/cmd_vel", Twist)
+person_left_pub = node.advertise("/person_left/cmd_vel", Twist)
+person_b_pub = node.advertise("/person_b/cmd_vel", Twist)
 
 latest_raw: np.ndarray | None = None
 latest_annotated: bytes | None = None
@@ -166,6 +168,8 @@ last_command_tilt_deg = 12.0
 zoom_factor = 1.0  # 1.0 = full FOV; >1 = digital zoom (crop+resize, narrower FOV)
 ZOOM_MIN = 1.0
 ZOOM_MAX = 6.0
+zoom_changed_ts = 0.0
+ZOOM_GRACE_S = 2.0
 
 paint_count = 0
 paint_last_ts = 0.0
@@ -528,33 +532,44 @@ def resolve_selected_target() -> Detection | None:
     if not strong:
         strong = list(detections)
 
+    # During the ZOOM_GRACE window right after a zoom change, ByteTrack is
+    # likely to have dropped the ID and the bbox geometry is in a new scale,
+    # so loosen the gates so the controller doesn't lose the target entirely.
+    in_zoom_grace = (zoom_changed_ts > 0 and
+                     (time.time() - zoom_changed_ts) < ZOOM_GRACE_S)
+    name_gate = (MAX_ANCHOR_REASSOC_PX * 2.5) if in_zoom_grace else MAX_ANCHOR_REASSOC_PX
+    cross_gate = (MAX_ANCHOR_REASSOC_CROSS_CLASS_PX * 2.0) if in_zoom_grace else MAX_ANCHOR_REASSOC_CROSS_CLASS_PX
+
     if detector_mode == "auto" and selected_id is not None:
         for d in strong:
             if d.det_id == selected_id:
                 return d
-        # ID lost: PREFER same-name + close to (anchor + predicted velocity)
-        # AND require bbox size similar to last-seen so we don't grab a tiny
-        # background sibling.
         if selected_anchor_xy and strong:
             ax_raw, ay_raw = selected_anchor_xy
             dt_lost = max(0.0, time.time() - last_target_seen_ts) if last_target_seen_ts else 0.0
             ax = ax_raw + target_vx_pix_s * dt_lost
             ay = ay_raw + target_vy_pix_s * dt_lost
             if selected_name is not None:
-                same_name = [d for d in strong if d.name == selected_name
-                             and _bbox_size_similar(d)]
+                # Inside zoom-grace skip the size-similarity filter — the
+                # newly-detected bbox is at the new zoom scale and won't
+                # match the pre-zoom size.
+                if in_zoom_grace:
+                    same_name = [d for d in strong if d.name == selected_name]
+                else:
+                    same_name = [d for d in strong if d.name == selected_name
+                                 and _bbox_size_similar(d)]
                 if same_name:
                     best = _nearest_to_anchor(same_name, ax, ay)
                     bcx = (best.bbox[0] + best.bbox[2]) / 2
                     bcy = (best.bbox[1] + best.bbox[3]) / 2
-                    if math.hypot(bcx - ax, bcy - ay) <= MAX_ANCHOR_REASSOC_PX:
+                    if math.hypot(bcx - ax, bcy - ay) <= name_gate:
                         return best
-            cross = [d for d in strong if _bbox_size_similar(d)]
+            cross = strong if in_zoom_grace else [d for d in strong if _bbox_size_similar(d)]
             if cross:
                 best = _nearest_to_anchor(cross, ax, ay)
                 bcx = (best.bbox[0] + best.bbox[2]) / 2
                 bcy = (best.bbox[1] + best.bbox[3]) / 2
-                if math.hypot(bcx - ax, bcy - ay) <= MAX_ANCHOR_REASSOC_CROSS_CLASS_PX:
+                if math.hypot(bcx - ax, bcy - ay) <= cross_gate:
                     return best
         return _ghost_target()
 
@@ -1016,6 +1031,7 @@ def on_joint_state(msg: Model) -> None:
 
 target_moving = False
 cars_moving = False
+people_walking = False
 
 
 def _moving_target_loop():
@@ -1054,6 +1070,22 @@ def _moving_target_loop():
         try:
             car_prius_pub.publish(prius)
             car_pickup_pub.publish(pickup)
+        except Exception:
+            pass
+        # Walking people: slow forward (1.2 m/s) + slow turn so each draws
+        # a larger calm circle than the cars. They use the standing-person
+        # mesh — no leg animation, just translation — but YOLO still
+        # detects them as "person" each frame.
+        p_left = Twist()
+        p_right = Twist()
+        if people_walking:
+            p_left.linear.x = 1.2
+            p_left.angular.z = 0.20
+            p_right.linear.x = 1.2
+            p_right.angular.z = -0.20
+        try:
+            person_left_pub.publish(p_left)
+            person_b_pub.publish(p_right)
         except Exception:
             pass
         time.sleep(0.04)
@@ -1169,7 +1201,8 @@ HTML_PAGE = r"""
         <button id="bSweep" title="full autonomous loop: pick → center → paint → NEXT target. Remembers painted targets across sessions.">Auto Serial Tracker: OFF</button>
         <button id="bSweepReset" title="forget painted memory">Reset memory</button>
         <button id="bMoveTgt" title="bounce the yellow ball in place">Move ball: OFF</button>
-        <button id="bMoveCars" title="drive the red+blue box-cars back and forth in front of the mantis">Move cars: OFF</button>
+        <button id="bMoveCars" title="drive the prius+pickup in circles in front of the mantis">Move cars: OFF</button>
+        <button id="bWalkPpl" title="walk the two persons forward + slight turn">Walk people: OFF</button>
         <button id="bKeyboard" title="enable keyboard control. Arrows/WASD = jog. Space = PAINT. T = toggle Tracking. C = Clear. H = Home. Esc = STOP.">Keyboard: OFF</button>
       </div>
 
@@ -1319,6 +1352,13 @@ bMoveCars.onclick=async ()=>{
   bMoveCars.textContent='Move cars: '+(moveCarsOn?'ON':'OFF');
   bMoveCars.classList.toggle('active',moveCarsOn);
   await fetch('/api/cars_moving',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:moveCarsOn})});
+};
+let walkPplOn=false;
+bWalkPpl.onclick=async ()=>{
+  walkPplOn=!walkPplOn;
+  bWalkPpl.textContent='Walk people: '+(walkPplOn?'ON':'OFF');
+  bWalkPpl.classList.toggle('active',walkPplOn);
+  await fetch('/api/people_walking',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:walkPplOn})});
 };
 document.addEventListener('keypress',e=>{
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return;
@@ -2039,11 +2079,20 @@ def api_cars_moving():
     return jsonify({"ok": True, "cars_moving": cars_moving})
 
 
+@app.post("/api/people_walking")
+def api_people_walking():
+    global people_walking
+    data = request.get_json(force=True, silent=True) or {}
+    if "enabled" in data:
+        people_walking = bool(data["enabled"])
+    return jsonify({"ok": True, "people_walking": people_walking})
+
+
 @app.post("/api/zoom")
 def api_zoom():
     global zoom_factor, selected_anchor_xy, smoothed_cx, smoothed_cy
     global smoothed_init, target_vx_pix_s, target_vy_pix_s
-    global pan_i_deg, tilt_i_deg, last_ex_norm, last_ey_norm
+    global pan_i_deg, tilt_i_deg, last_ex_norm, last_ey_norm, zoom_changed_ts
     data = request.get_json(force=True, silent=True) or {}
     new_z = safe_float(data, "zoom", zoom_factor, ZOOM_MIN, ZOOM_MAX)
     with lock:
@@ -2077,6 +2126,8 @@ def api_zoom():
             pan_deg = actual_pan_deg
             tilt_deg = actual_tilt_deg
         zoom_factor = new_z
+        if abs(new_z - old_z) > 0.01:
+            zoom_changed_ts = time.time()
         # ByteTrack keeps the same ID across moderate zoom changes if the
         # target is still detected. Don't drop selected_id — that forced the
         # resolver into name+anchor fallback which often locked onto a

@@ -120,6 +120,9 @@
       <name>person_b</name>
       <pose>40 -2 0.0 0 0 -1.5708</pose>
       <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/standing%20person/3</uri>
+      <plugin filename="gz-sim-velocity-control-system" name="gz::sim::systems::VelocityControl">
+        <topic>person_b/cmd_vel</topic>
+      </plugin>
     </include>
 
     <include>
@@ -150,6 +153,9 @@
       <name>person_left</name>
       <pose>26 -10 0.0 0 0 0</pose>
       <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/standing%20person/3</uri>
+      <plugin filename="gz-sim-velocity-control-system" name="gz::sim::systems::VelocityControl">
+        <topic>person_left/cmd_vel</topic>
+      </plugin>
     </include>
 
     <!-- Moving target: a bright orange ball driven on a back-and-forth
