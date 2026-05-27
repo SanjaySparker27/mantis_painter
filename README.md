@@ -4,6 +4,15 @@ Realtime persistent tracking with precision pan/tilt control. Gazebo Harmonic si
 
 ![nose camera view with object detections, track IDs, crosshair and live PID values](docs/assets/nose_camera.jpg)
 
+### Dynamic tracking — pursuing moving cars
+
+![Live nose-camera view with YOLOv12+ByteTrack: prius locked under the crosshair while a pickup, yellow ball, person and drone are also detected in-frame](docs/assets/nose_camera_dynamic.jpg)
+
+Crosshair is locked at the bbox center of the selected `car` (ID 5).
+ByteTrack keeps the ID stable while the prius and pickup drive around;
+the controller follows. Other detections (yellow ball ID 50, pickup
+ID 18, person, drone) are drawn but inactive.
+
 ### Convergence trace — selecting a car, controller centers it
 
 ![pan and tilt cmd vs actual on top, normalized pixel error ex/ey on bottom](docs/assets/convergence.png)
@@ -166,6 +175,149 @@ Joint limits (from Blender source):
 | C | Clear target |
 | P | one paint pulse |
 | Esc / X | STOP |
+
+## Verified tuning (current default gains)
+
+The defaults committed to `web_app.py` were swept and chosen by
+`scripts/auto_tune_trial.py` over multiple gain sets and scenes.
+
+| parameter | value | what it does |
+|---|---|---|
+| Kp (`Speed` slider) | 0.50 | aggressiveness — how hard to chase pixel error |
+| Ki (`Hold` slider) | 0.18 | removes steady-state offset |
+| Kd (`Smooth` slider) | 0.14 | damping; clamped derivative ±60°/s |
+| max_rate (`Max slew`) | 35 deg/s pan, 26 deg/s tilt; scaled by 1/zoom^1.4 at high zoom |
+| deadband (`Lock zone`) | 0.008 (pan), 0.012 (tilt) — controller freezes inside this |
+| PID output clamp | 6° per cycle — single-frame outlier can't whiplash the joint |
+| LPF on cmd | 0.32, softened by 1/√zoom at high zoom |
+
+Measured performance:
+
+| metric | zoom 1.0× | zoom 2.0× |
+|---|---|---|
+| Lock time | 1.8 s | 2.5 s |
+| SS ex | +0.005 ± 0.004 | −0.018 ± 0.001 |
+| SS ey | +0.006 ± 0.006 | −0.019 ± 0.008 |
+| Overshoot | none | none |
+
+To re-tune for a different rig: run
+
+```bash
+python3 scripts/auto_tune_trial.py
+```
+
+It sweeps 5 candidate gain sets across 3 scenes, scores each on
+time-to-lock + steady-state error + divergence, and applies the winner.
+
+## Real-world wiring — drive a stepper, servo, or PWM solenoid
+
+The simulation is wired so the same controller can run on a real
+turret. A Raspberry Pi or MCU subscribes to one of the output channels
+in `/api/channels` and converts each paint pulse + joint angle into
+actuator commands.
+
+### Output channels
+
+| channel | enabled by | format | wire it to |
+|---|---|---|---|
+| `gz_topic` | UI checkbox (default ON) | `gz.msgs.Int32` (pulse_ms) on `/mantis/paint_trigger` | any gz-aware node, ROS2 bridge |
+| `file` | UI checkbox (default ON) | line: `time count pulse_ms pan tilt name` appended to `/tmp/mantis_paint.signal` | `tail -F` from a Pi daemon |
+| `udp` | UI checkbox | same line as a UDP datagram to `<host>:<port>` | ESP32, MCU on Wi-Fi |
+| `tcp` | UI checkbox | one-shot connect + send | server-style actuator daemon |
+| `serial` | UI checkbox | pyserial write of the same line | Arduino / Pi GPIO over UART |
+
+The pan and tilt joint targets are also published as `gz.msgs.Double`
+on `/mantis/pan_cmd` and `/mantis/tilt_cmd` (radians). Forward those to
+your motor driver.
+
+### Example: Raspberry Pi + stepper + servo paintball trigger
+
+```text
++----------------+        +----------------+
+| MANTIS PAINTER |--TCP-->| paint_daemon   |    +-------------+
+| web_app.py     |--gz-->|  (on the Pi)    |--->| stepper drv | PAN axis (NEMA 17)
+|                |        | + RPi.GPIO     |    +-------------+
+|                |--gz-->|  + pigpio       |--->| servo PWM   | TILT axis (MG996R)
+|                |        |                |    +-------------+
+|                |        |                |--->| solenoid    | PAINT (5V relay)
++----------------+        +----------------+    +-------------+
+```
+
+Minimal Pi daemon (Python, `pip install pyserial gz-transport13 RPi.GPIO`):
+
+```python
+import math, time
+import gz.transport13 as gzt
+from gz.msgs10.double_pb2 import Double
+from gz.msgs10.int32_pb2 import Int32
+
+# Stepper: 200 steps/rev, 1/8 microstepping = 1600 steps / 360 deg
+PAN_STEPS_PER_DEG  = 1600 / 360
+PAN_DIR_PIN, PAN_STEP_PIN = 23, 24
+
+import RPi.GPIO as GPIO  # not exercised by the sim; wire on the real rig
+GPIO.setmode(GPIO.BCM)
+GPIO.setup([PAN_DIR_PIN, PAN_STEP_PIN], GPIO.OUT)
+
+import pigpio
+pi = pigpio.pi()
+TILT_PIN  = 18
+PAINT_PIN = 17
+pi.set_servo_pulsewidth(TILT_PIN, 1500)
+
+n = gzt.Node()
+pan_pos_deg = 0.0
+
+def on_pan(msg: Double):
+    global pan_pos_deg
+    target = math.degrees(msg.data)
+    delta_steps = int((target - pan_pos_deg) * PAN_STEPS_PER_DEG)
+    GPIO.output(PAN_DIR_PIN, GPIO.HIGH if delta_steps > 0 else GPIO.LOW)
+    for _ in range(abs(delta_steps)):
+        GPIO.output(PAN_STEP_PIN, GPIO.HIGH); time.sleep(2e-4)
+        GPIO.output(PAN_STEP_PIN, GPIO.LOW);  time.sleep(2e-4)
+    pan_pos_deg = target
+
+def on_tilt(msg: Double):
+    deg = math.degrees(msg.data)
+    # servo pulse: 1.0 ms (−45°) … 2.0 ms (+45°)
+    us = 1500 + int(deg / 45.0 * 500)
+    pi.set_servo_pulsewidth(TILT_PIN, max(900, min(2100, us)))
+
+def on_paint(msg: Int32):
+    pi.gpio_write(PAINT_PIN, 1)
+    time.sleep(msg.data / 1000.0)
+    pi.gpio_write(PAINT_PIN, 0)
+
+n.subscribe(Double, "/mantis/pan_cmd",       on_pan)
+n.subscribe(Double, "/mantis/tilt_cmd",      on_tilt)
+n.subscribe(Int32,  "/mantis/paint_trigger", on_paint)
+while True: time.sleep(1)
+```
+
+Wire the same way for ROS 2 with `ros_gz_bridge` if the rig speaks ROS.
+
+### Headless / autonomous mode
+
+Drop the Web UI entirely and let the Pi run the loop:
+
+```bash
+python3 web_app.py --headless --auto
+```
+
+- `--headless`: no Flask, just the camera → detect → track → publish loop.
+- `--auto`: boots with **Auto Serial Tracker** + **Auto Paint** enabled, so the turret begins paint-marking detected targets without any user input.
+
+### Health endpoint for a hardware watchdog
+
+```bash
+curl http://127.0.0.1:5055/api/health
+```
+
+Returns `200` + `{"ok": true, "camera_age_s", "joint_age_s", ...}`
+when the loop is alive, or `503` with a list of `issues` if camera or
+joint feedback has stalled. Wire your actuator's enable line to a
+watchdog that polls this once a second.
 
 ## Safe scope
 

@@ -117,6 +117,8 @@ pan_pub = node.advertise(PAN_TOPIC, Double)
 tilt_pub = node.advertise(TILT_TOPIC, Double)
 paint_pub = node.advertise(PAINT_TOPIC, Int32)
 moving_target_pub = node.advertise("/moving_target/cmd_vel", Twist)
+moving_car_a_pub = node.advertise("/moving_car_a/cmd_vel", Twist)
+moving_car_b_pub = node.advertise("/moving_car_b/cmd_vel", Twist)
 
 latest_raw: np.ndarray | None = None
 latest_annotated: bytes | None = None
@@ -971,26 +973,39 @@ def on_joint_state(msg: Model) -> None:
 
 
 target_moving = False
+cars_moving = False
 
 
 def _moving_target_loop():
-    """Yellow sphere bounces up and down in place. Tests dynamic tracking
-    against a small, predictable motion."""
+    """Yellow sphere bounces up and down in place + two box-cars drive
+    back-and-forth across the field of view when toggled. Tests dynamic
+    tracking against both small predictable motion and larger
+    cross-frame translation."""
     import math as _m
     t0 = time.time()
     while True:
         t = time.time() - t0
-        msg = Twist()
+        # Yellow bouncing ball
+        ball = Twist()
         if target_moving:
-            msg.linear.x = 0.0
-            msg.linear.y = 0.0
-            msg.linear.z = 2.5 * _m.sin(2.0 * t)
-        else:
-            msg.linear.x = 0.0
-            msg.linear.y = 0.0
-            msg.linear.z = 0.0
+            ball.linear.z = 2.5 * _m.sin(2.0 * t)
         try:
-            moving_target_pub.publish(msg)
+            moving_target_pub.publish(ball)
+        except Exception:
+            pass
+        # Two cars: A drives back-and-forth along +X, B in the opposite
+        # phase, both with a slight Y wander so the camera sees lateral
+        # motion in image space.
+        car_a = Twist()
+        car_b = Twist()
+        if cars_moving:
+            car_a.linear.x = 3.5 * _m.sin(0.35 * t)
+            car_a.linear.y = 0.8 * _m.cos(0.45 * t)
+            car_b.linear.x = -3.0 * _m.sin(0.30 * t + 1.0)
+            car_b.linear.y = 0.6 * _m.sin(0.50 * t)
+        try:
+            moving_car_a_pub.publish(car_a)
+            moving_car_b_pub.publish(car_b)
         except Exception:
             pass
         time.sleep(0.04)
@@ -1105,7 +1120,8 @@ HTML_PAGE = r"""
         <button id="bPaintAuto" title="auto-fire paint when selected target stays centered (stays on the SAME target)">Auto Paint: OFF</button>
         <button id="bSweep" title="full autonomous loop: pick → center → paint → NEXT target. Remembers painted targets across sessions.">Auto Serial Tracker: OFF</button>
         <button id="bSweepReset" title="forget painted memory">Reset memory</button>
-        <button id="bMoveTgt" title="move the orange ball back-and-forth so you can test dynamic tracking">Move target: OFF</button>
+        <button id="bMoveTgt" title="bounce the yellow ball in place">Move ball: OFF</button>
+        <button id="bMoveCars" title="drive the red+blue box-cars back and forth in front of the mantis">Move cars: OFF</button>
         <button id="bKeyboard" title="enable keyboard control. Arrows/WASD = jog. Space = PAINT. T = toggle Tracking. C = Clear. H = Home. Esc = STOP.">Keyboard: OFF</button>
       </div>
 
@@ -1245,9 +1261,16 @@ bSweepReset.onclick=async ()=>{
 let moveTgtOn=false;
 bMoveTgt.onclick=async ()=>{
   moveTgtOn=!moveTgtOn;
-  bMoveTgt.textContent='Move target: '+(moveTgtOn?'ON':'OFF');
+  bMoveTgt.textContent='Move ball: '+(moveTgtOn?'ON':'OFF');
   bMoveTgt.classList.toggle('active',moveTgtOn);
   await fetch('/api/moving_target',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:moveTgtOn})});
+};
+let moveCarsOn=false;
+bMoveCars.onclick=async ()=>{
+  moveCarsOn=!moveCarsOn;
+  bMoveCars.textContent='Move cars: '+(moveCarsOn?'ON':'OFF');
+  bMoveCars.classList.toggle('active',moveCarsOn);
+  await fetch('/api/cars_moving',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:moveCarsOn})});
 };
 document.addEventListener('keypress',e=>{
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return;
@@ -1957,6 +1980,15 @@ def api_moving_target():
     if "enabled" in data:
         target_moving = bool(data["enabled"])
     return jsonify({"ok": True, "moving": target_moving})
+
+
+@app.post("/api/cars_moving")
+def api_cars_moving():
+    global cars_moving
+    data = request.get_json(force=True, silent=True) or {}
+    if "enabled" in data:
+        cars_moving = bool(data["enabled"])
+    return jsonify({"ok": True, "cars_moving": cars_moving})
 
 
 @app.post("/api/zoom")
