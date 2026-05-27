@@ -101,10 +101,10 @@ class Gains:
     deadband_norm: float
 
 
-pan_gains = Gains(kp=0.55, ki=0.20, kd=0.04, max_rate_deg_s=25.0,
-                  integral_clamp_deg=8.0, deadband_norm=0.012)
-tilt_gains = Gains(kp=0.55, ki=0.20, kd=0.04, max_rate_deg_s=18.0,
-                   integral_clamp_deg=6.0, deadband_norm=0.016)
+pan_gains = Gains(kp=0.55, ki=0.15, kd=0.12, max_rate_deg_s=45.0,
+                  integral_clamp_deg=3.5, deadband_norm=0.018)
+tilt_gains = Gains(kp=0.55, ki=0.15, kd=0.12, max_rate_deg_s=32.0,
+                   integral_clamp_deg=3.0, deadband_norm=0.022)
 
 
 lock = threading.Lock()
@@ -189,7 +189,7 @@ def _load_painted_memory():
 
 _load_painted_memory()
 
-LOST_GRACE_S = 0.8
+LOST_GRACE_S = 2.0  # keep selection alive longer when YOLO loses confidence briefly
 
 YOLO_WEIGHTS_TRY = [
     "yolo12n.pt",
@@ -250,8 +250,8 @@ def detect_with_yolo(frame: np.ndarray) -> list[Detection] | None:
             source=frame,
             persist=True,
             tracker=_yolo_tracker_cfg,
-            conf=0.30,
-            iou=0.5,
+            conf=0.15,
+            iou=0.4,
             imgsz=384,
             verbose=False,
         )
@@ -408,12 +408,36 @@ def clear_selection() -> None:
     target_vy_pix_s = 0.0
     last_target_seen_ts = 0.0
     reset_controller_state()
+    _bytetrack_reset()
 
 
-MAX_ANCHOR_REASSOC_PX = 240.0
+def _bytetrack_reset() -> None:
+    """Drop the persistent ByteTrack track list. New ones will be created on
+    the next inference. Prevents stale-ID confusion + slow tracker bloat."""
+    if _yolo_model is None:
+        return
+    try:
+        preds = getattr(_yolo_model, "predictor", None)
+        if preds and getattr(preds, "trackers", None):
+            for t in preds.trackers:
+                try:
+                    t.reset()
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
-MIN_TRACK_SCORE = 0.15
+MAX_ANCHOR_REASSOC_PX = 180.0
+MAX_ANCHOR_REASSOC_CROSS_CLASS_PX = 140.0
+MIN_TRACK_SCORE = 0.10  # lower so Gazebo renders with weak YOLO confidence still track
+
+
+def _nearest_to_anchor(cands, ax, ay):
+    return min(cands, key=lambda d: (
+        ((d.bbox[0] + d.bbox[2]) / 2 - ax) ** 2
+        + ((d.bbox[1] + d.bbox[3]) / 2 - ay) ** 2
+    ))
 
 
 def resolve_selected_target() -> Detection | None:
@@ -422,24 +446,42 @@ def resolve_selected_target() -> Detection | None:
     strong = [d for d in detections if d.score >= MIN_TRACK_SCORE]
     if not strong:
         strong = list(detections)
+
+    # YOLO+ByteTrack: prefer stable track ID. If the ID dropped this frame,
+    # fall back to nearest detection (any class) within a tight radius —
+    # rescues us when YOLO flips 'car' <-> 'truck' between frames or the
+    # confidence dips for one frame.
     if detector_mode == "auto" and selected_id is not None:
         for d in strong:
             if d.det_id == selected_id:
                 return d
+        if selected_anchor_xy and strong:
+            ax, ay = selected_anchor_xy
+            best = _nearest_to_anchor(strong, ax, ay)
+            bcx = (best.bbox[0] + best.bbox[2]) / 2
+            bcy = (best.bbox[1] + best.bbox[3]) / 2
+            if math.hypot(bcx - ax, bcy - ay) <= MAX_ANCHOR_REASSOC_CROSS_CLASS_PX:
+                return best
         return None
+
     if selected_name is not None:
         named = [d for d in strong if d.name == selected_name]
     else:
         named = list(strong)
     if not named:
+        # Color: try class-agnostic spatial recovery
+        if selected_anchor_xy and strong:
+            ax, ay = selected_anchor_xy
+            best = _nearest_to_anchor(strong, ax, ay)
+            bcx = (best.bbox[0] + best.bbox[2]) / 2
+            bcy = (best.bbox[1] + best.bbox[3]) / 2
+            if math.hypot(bcx - ax, bcy - ay) <= MAX_ANCHOR_REASSOC_CROSS_CLASS_PX:
+                return best
         return None
     if selected_anchor_xy is None:
         return named[0] if len(named) == 1 else None
     ax, ay = selected_anchor_xy
-    best = min(named, key=lambda d: (
-        ((d.bbox[0] + d.bbox[2]) / 2 - ax) ** 2
-        + ((d.bbox[1] + d.bbox[3]) / 2 - ay) ** 2
-    ))
+    best = _nearest_to_anchor(named, ax, ay)
     bcx = (best.bbox[0] + best.bbox[2]) / 2
     bcy = (best.bbox[1] + best.bbox[3]) / 2
     dist = math.hypot(bcx - ax, bcy - ay)
@@ -593,7 +635,7 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     tilt_max_step = tilt_gains.max_rate_deg_s * dt
     pan_step_raw = clamp(desired_pan - pan_deg, -pan_max_step, pan_max_step)
     tilt_step_raw = clamp(desired_tilt - tilt_deg, -tilt_max_step, tilt_max_step)
-    lpf = 0.22
+    lpf = 0.30
 
     # Inside deadband: freeze command at actual joint position and decay
     # integral fast so we don't accumulate noise into the next motion.
@@ -752,8 +794,12 @@ def draw_overlay(frame: np.ndarray) -> np.ndarray:
 
 
 _detection_thread_busy = False
+_detection_busy_since = 0.0
 _detection_last_dispatch = 0.0
+_detection_last_completed = 0.0
+_detection_last_latency_s = 0.0
 DETECTION_INTERVAL_S = 1.0 / 8.0  # cap detection at 8 Hz to free CPU
+DETECTION_BUSY_TIMEOUT_S = 3.0    # force-reset busy flag if worker hangs
 
 
 def run_detector(frame: np.ndarray) -> list[Detection]:
@@ -768,6 +814,8 @@ def run_detector(frame: np.ndarray) -> list[Detection]:
 def detection_worker(frame: np.ndarray) -> None:
     global detections, recent_detections, recent_detection_stamp
     global _detection_thread_busy, yolo_status
+    global _detection_last_completed, _detection_last_latency_s
+    t0 = time.time()
     try:
         try:
             result = run_detector(frame)
@@ -779,6 +827,8 @@ def detection_worker(frame: np.ndarray) -> None:
             if result:
                 recent_detections = list(result)
                 recent_detection_stamp = time.time()
+            _detection_last_completed = time.time()
+            _detection_last_latency_s = _detection_last_completed - t0
     finally:
         _detection_thread_busy = False
 
@@ -801,11 +851,16 @@ def on_image(msg: Image) -> None:
     ok, jpg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 72])
     if ok:
         latest_annotated = jpg.tobytes()
-    global _detection_last_dispatch
+    global _detection_last_dispatch, _detection_thread_busy, _detection_busy_since
     now = time.time()
+    # Force-reset busy flag if a previous worker has been stuck too long
+    # (e.g. YOLO inference hung, model reload, or exception escaped lock).
+    if _detection_thread_busy and (now - _detection_busy_since) > DETECTION_BUSY_TIMEOUT_S:
+        _detection_thread_busy = False
     if (not _detection_thread_busy
             and (now - _detection_last_dispatch) >= DETECTION_INTERVAL_S):
         _detection_thread_busy = True
+        _detection_busy_since = now
         _detection_last_dispatch = now
         threading.Thread(target=detection_worker, args=(frame,),
                          daemon=True).start()
@@ -832,6 +887,25 @@ def camera_thread() -> None:
 
 
 threading.Thread(target=camera_thread, daemon=True).start()
+
+
+def _yolo_prewarm():
+    """Load YOLO + run one dummy inference so the first real frame
+    doesn't pay the cold-start hit (which was the cause of 'no detections
+    until I click Manual' — the first dispatch was eating ~1.5 s loading
+    the model and another ~0.5 s warming the torch graph)."""
+    m = _load_yolo()
+    if m is None:
+        return
+    try:
+        dummy = np.zeros((384, 640, 3), dtype=np.uint8)
+        m.predict(source=dummy, imgsz=384, conf=0.30, iou=0.5, verbose=False)
+    except Exception as exc:
+        global yolo_status
+        yolo_status = f"prewarm warn: {exc}"
+
+
+threading.Thread(target=_yolo_prewarm, daemon=True).start()
 
 
 HTML_PAGE = r"""
@@ -1341,6 +1415,9 @@ def api_status():
             "detector_mode": detector_mode,
             "tracker": ("ByteTrack" if detector_mode == "auto" else "AnchorMatch"),
             "yolo_status": yolo_status,
+            "detection_latency_ms": int(_detection_last_latency_s * 1000),
+            "detection_age_s": (time.time() - _detection_last_completed)
+                               if _detection_last_completed else None,
             "paint_count": paint_count,
             "paint_auto": paint_auto,
             "sweep_enabled": sweep_enabled,
@@ -1490,10 +1567,10 @@ def api_gains():
     data = request.get_json(force=True, silent=True) or {}
     with lock:
         if data.get("reset"):
-            pan_gains.kp = 0.55; pan_gains.ki = 0.20; pan_gains.kd = 0.04
-            pan_gains.max_rate_deg_s = 25.0; pan_gains.deadband_norm = 0.012
-            tilt_gains.kp = 0.55; tilt_gains.ki = 0.20; tilt_gains.kd = 0.04
-            tilt_gains.max_rate_deg_s = 18.0; tilt_gains.deadband_norm = 0.016
+            pan_gains.kp = 0.55; pan_gains.ki = 0.15; pan_gains.kd = 0.12
+            pan_gains.max_rate_deg_s = 45.0; pan_gains.deadband_norm = 0.018
+            tilt_gains.kp = 0.55; tilt_gains.ki = 0.15; tilt_gains.kd = 0.12
+            tilt_gains.max_rate_deg_s = 32.0; tilt_gains.deadband_norm = 0.022
             reset_controller_state()
             return jsonify({"ok": True, "reset": True})
         for key in ("kp", "ki", "kd"):
@@ -1840,23 +1917,31 @@ def _agent_execute(action: str, payload: dict | None = None) -> str:
     return f"unknown action '{action}'"
 
 
+VALID_ACTIONS = {
+    "paint", "home", "stop", "track_on", "track_off", "tracking_on",
+    "tracking_off", "sweep_on", "sweep_off", "serial_on", "serial_off",
+    "auto_paint_on", "auto_paint_off", "select_name", "select", "clear",
+}
+
+
 def _agent_parse(reply: str) -> tuple[str | None, dict]:
+    """Only return an action if the reply explicitly contains a JSON
+    {action: ...} block. No keyword fallback — that was firing actions on
+    every greeting that happened to contain 'home' or 'paint' in the
+    model's chit-chat."""
     import json as _json, re as _re
-    m = _re.search(r"\{[^{}]*\"action\"[^{}]*\}", reply)
-    if m:
+    matches = _re.findall(r"\{[^{}]*\"action\"[^{}]*\}", reply)
+    for m in matches:
         try:
-            obj = _json.loads(m.group(0))
-            if isinstance(obj, dict) and "action" in obj:
-                action = str(obj.pop("action"))
-                return action, obj
+            obj = _json.loads(m)
         except Exception:
-            pass
-    lower = reply.lower()
-    for kw in ("paint", "home", "stop", "track_on", "track_off",
-               "sweep_on", "sweep_off", "auto_paint_on", "auto_paint_off",
-               "clear"):
-        if kw in lower:
-            return kw, {}
+            continue
+        if not isinstance(obj, dict) or "action" not in obj:
+            continue
+        action = str(obj.pop("action")).strip().lower()
+        if action not in VALID_ACTIONS:
+            continue
+        return action, obj
     return None, {}
 
 
@@ -1899,13 +1984,26 @@ def api_agent_chat():
         return jsonify({"ok": False, "error": "no ollama model available"})
 
     sys_prompt = (
-        "You are MANTIS, a turret-controller assistant for a Gazebo simulation. "
-        "Detected targets (names) and current pan/tilt are in the user's "
-        "context. Respond briefly. To act, emit a JSON object on its own line "
-        "like {\"action\": \"paint\"} or {\"action\": \"select_name\", "
-        "\"name\": \"car\"}. Allowed actions: paint, home, stop, track_on, "
-        "track_off, sweep_on, sweep_off, auto_paint_on, auto_paint_off, "
-        "select_name (with name), clear."
+        "You are MANTIS, a helpful assistant. You can talk freely about any "
+        "topic AND you can optionally control a pan/tilt camera in a Gazebo "
+        "simulation. \n\n"
+        "Tool use rule: ONLY emit a JSON action when the user CLEARLY requests "
+        "an action on the MANTIS system (e.g. 'paint the car', 'start "
+        "tracking', 'stop', 'select the truck'). For greetings, questions, "
+        "explanations, chit-chat, or anything else, reply in plain text only — "
+        "no JSON. \n\n"
+        "When you DO act, put the JSON on its own line as the very last line, "
+        "preceded by a 1-sentence confirmation. Format examples:\n"
+        "  Got it, painting now.\n"
+        "  {\"action\": \"paint\"}\n"
+        "  Switching to the car.\n"
+        "  {\"action\": \"select_name\", \"name\": \"car\"}\n\n"
+        "Allowed actions: paint, home, stop, track_on, track_off, sweep_on, "
+        "sweep_off, auto_paint_on, auto_paint_off, select_name (with name), "
+        "clear. \n\n"
+        "Do NOT invent actions or arguments. If the user's request is "
+        "ambiguous, ask a clarifying question in plain text instead of "
+        "guessing an action."
     )
     det_names = sorted({d.name for d in (detections or recent_detections)})
     user_ctx = (

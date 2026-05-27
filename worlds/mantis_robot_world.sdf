@@ -78,72 +78,72 @@
     <include>
       <name>mantis_robot</name>
       <pose>0 -8 0.0 0 0 0</pose>
-      <uri>/home/sanju/MANTIS_PAINTER/models/mantis_robot</uri>
+      <uri>../models/mantis_robot</uri>
     </include>
 
     <include>
       <name>car_prius_front</name>
       <pose>24 -2 0.03 0 0 1.5708</pose>
-      <uri>/home/sanju/.gz/fuel/fuel.gazebosim.org/openrobotics/models/prius%20hybrid/3</uri>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/prius%20hybrid/3</uri>
     </include>
     <include>
       <name>car_pickup_right</name>
       <pose>34 5 0.02 0 0 1.5708</pose>
-      <uri>/home/sanju/.gz/fuel/fuel.gazebosim.org/openrobotics/models/pickup/4</uri>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/pickup/4</uri>
     </include>
 
     <include>
       <name>aruco_tag_a</name>
       <pose>14 6 1.0 0 0 0</pose>
-      <uri>/home/sanju/PX4-Autopilot/Tools/simulation/gz/models/arucotag</uri>
+      <uri>../models/external/arucotag</uri>
     </include>
 
     <include>
       <name>aruco_tag_b</name>
       <pose>28 12 1.0 0 0 0</pose>
-      <uri>/home/sanju/PX4-Autopilot/Tools/simulation/gz/models/arucotag</uri>
+      <uri>../models/external/arucotag</uri>
     </include>
 
     <include>
       <name>car_pickup_b</name>
       <pose>18 8 0.02 0 0 0</pose>
-      <uri>/home/sanju/.gz/fuel/fuel.gazebosim.org/openrobotics/models/pickup/4</uri>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/pickup/4</uri>
     </include>
 
     <include>
       <name>person_b</name>
       <pose>40 -2 0.0 0 0 -1.5708</pose>
-      <uri>/home/sanju/.gz/fuel/fuel.gazebosim.org/openrobotics/models/standing%20person/3</uri>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/standing%20person/3</uri>
     </include>
 
     <include>
       <name>helipad_a</name>
       <pose>20 -12 0.05 0 0 0</pose>
-      <uri>/home/sanju/PX4-Autopilot/Tools/simulation/gz/models/helipad</uri>
+      <uri>../models/external/helipad</uri>
     </include>
 
     <include>
       <name>rover_a</name>
       <pose>38 -3 0.0 0 0 1.5708</pose>
-      <uri>/home/sanju/PX4-Autopilot/Tools/simulation/gz/models/r1_rover</uri>
+      <uri>../models/external/r1_rover</uri>
     </include>
 
     <include>
       <name>cessna_a</name>
       <pose>10 -3 0.3 0 0 0.6</pose>
-      <uri>/home/sanju/PX4-Autopilot/Tools/simulation/gz/models/rc_cessna</uri>
+      <uri>../models/external/rc_cessna</uri>
     </include>
 
     <include>
       <name>x500_static</name>
       <pose>30 -6 0.6 0 0 0</pose>
-      <uri>/home/sanju/PX4-Autopilot/Tools/simulation/gz/models/x500</uri>
+      <uri>../models/external/x500</uri>
     </include>
 
     <include>
       <name>person_left</name>
       <pose>26 -10 0.0 0 0 0</pose>
-      <uri>/home/sanju/.gz/fuel/fuel.gazebosim.org/openrobotics/models/standing%20person/3</uri>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/standing%20person/3</uri>
     </include>
   </world>
 </sdf>

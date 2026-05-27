@@ -1,0 +1,8 @@
+flask>=3.0
+numpy>=1.26
+opencv-python>=4.8
+ultralytics>=8.4
+torch>=2.2
+pyserial>=3.5
+matplotlib>=3.8
+requests>=2.31
