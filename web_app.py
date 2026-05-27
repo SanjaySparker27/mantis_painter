@@ -444,6 +444,13 @@ def clear_selection() -> None:
     target_vy_pix_s = 0.0
     last_target_seen_ts = 0.0
     reset_controller_state()
+    # Do NOT reset ByteTrack tracker here — that would invalidate the IDs
+    # the user just selected on the click that triggered this call.
+    # Use clear_selection_full() for explicit deselects / mode changes.
+
+
+def clear_selection_full() -> None:
+    clear_selection()
     _bytetrack_reset()
 
 
@@ -1974,13 +1981,10 @@ def api_zoom():
             pan_deg = actual_pan_deg
             tilt_deg = actual_tilt_deg
         zoom_factor = new_z
-        # ByteTrack IDs almost never survive a sudden zoom change because
-        # the input image content jumps. Drop the stale ID and let the
-        # next frame's resolver bind to whatever detection is nearest to
-        # the remapped anchor — the actual physical target.
-        global selected_id
-        if selected_id is not None and detector_mode == "auto":
-            selected_id = None
+        # ByteTrack keeps the same ID across moderate zoom changes if the
+        # target is still detected. Don't drop selected_id — that forced the
+        # resolver into name+anchor fallback which often locked onto a
+        # neighbour. Anchor remap above is enough.
     return jsonify({"ok": True, "zoom": zoom_factor})
 
 
