@@ -83,13 +83,19 @@
 
     <include>
       <name>car_prius_front</name>
-      <pose>24 -2 0.03 0 0 1.5708</pose>
+      <pose>38 4 0.03 0 0 0</pose>
       <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/prius%20hybrid/3</uri>
+      <plugin filename="gz-sim-velocity-control-system" name="gz::sim::systems::VelocityControl">
+        <topic>car_prius_front/cmd_vel</topic>
+      </plugin>
     </include>
     <include>
       <name>car_pickup_right</name>
-      <pose>34 5 0.02 0 0 1.5708</pose>
+      <pose>14 4 0.02 0 0 3.14159</pose>
       <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/pickup/4</uri>
+      <plugin filename="gz-sim-velocity-control-system" name="gz::sim::systems::VelocityControl">
+        <topic>car_pickup_right/cmd_vel</topic>
+      </plugin>
     </include>
 
     <include>

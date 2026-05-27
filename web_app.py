@@ -117,6 +117,8 @@ pan_pub = node.advertise(PAN_TOPIC, Double)
 tilt_pub = node.advertise(TILT_TOPIC, Double)
 paint_pub = node.advertise(PAINT_TOPIC, Int32)
 moving_target_pub = node.advertise("/moving_target/cmd_vel", Twist)
+car_prius_pub = node.advertise("/car_prius_front/cmd_vel", Twist)
+car_pickup_pub = node.advertise("/car_pickup_right/cmd_vel", Twist)
 
 latest_raw: np.ndarray | None = None
 latest_annotated: bytes | None = None
@@ -663,7 +665,11 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
             target_vy_pix_s = 0.0
     last_target_cx = cx
     last_target_cy = cy
-    last_target_seen_ts = now
+    # Only treat REAL detections as 'seen'. Ghost targets must NOT refresh
+    # this stamp or the persistence horizon never expires and the loop
+    # keeps fabricating ghosts forever.
+    if target.score > 0:
+        last_target_seen_ts = now
 
     # Dead-zone on velocity so detector jitter doesn't drive feedforward.
     vx_eff = target_vx_pix_s if abs(target_vx_pix_s) > 25.0 else 0.0
@@ -992,21 +998,23 @@ cars_moving = False
 
 
 def _moving_target_loop():
-    """Yellow sphere bounces up and down in place + the two stock Fuel
-    vehicles (prius + pickup) drive around a circle ~28 m in front of
-    the mantis when toggled. Moves them via the world set_pose service
-    so the fuel models don't need any custom plugin."""
+    """Yellow sphere bounces in place. Prius + pickup drive in a true
+    smooth circle in front of the mantis using VelocityControl on each
+    model's cmd_vel topic (so the motion is continuous in the physics
+    simulator, not teleported every 200 ms via set_pose).
+
+    Each car gets:
+        linear.x  =  speed   (forward in body frame)
+        angular.z =  speed / radius  (yaw rate that draws a circle)
+    """
     import math as _m
-    import subprocess as _sp
-    CAR_NAMES = ("car_prius_front", "car_pickup_right")
-    CIRCLE_CX, CIRCLE_CY = 26.0, 4.0       # ~28 m in front of mantis at (0,-8)
-    CIRCLE_R = 12.0
-    PERIOD_S = 22.0
+    CIRCLE_R = 10.0
+    SPEED = 3.5                 # m/s tangential — calm cruise
+    OMEGA = SPEED / CIRCLE_R    # yaw rate so the body draws the circle
     t0 = time.time()
-    last_pose_pub = 0.0
     while True:
         t = time.time() - t0
-        # Yellow bouncing ball over Twist topic
+        # Yellow bouncing ball
         ball = Twist()
         if target_moving:
             ball.linear.z = 2.5 * _m.sin(2.0 * t)
@@ -1014,34 +1022,19 @@ def _moving_target_loop():
             moving_target_pub.publish(ball)
         except Exception:
             pass
-        # Circle the cars at 5 Hz via the world set_pose service
-        if cars_moving and (time.time() - last_pose_pub) > 0.18:
-            last_pose_pub = time.time()
-            phase = 2.0 * _m.pi * (t % PERIOD_S) / PERIOD_S
-            for i, name in enumerate(CAR_NAMES):
-                theta = phase + i * _m.pi  # opposite sides of the circle
-                x = CIRCLE_CX + CIRCLE_R * _m.cos(theta)
-                y = CIRCLE_CY + CIRCLE_R * _m.sin(theta)
-                yaw = theta + _m.pi / 2.0   # face tangent
-                qz = _m.sin(yaw / 2.0)
-                qw = _m.cos(yaw / 2.0)
-                req = (
-                    f'name: "{name}" '
-                    f'position {{x: {x:.3f} y: {y:.3f} z: 0.03}} '
-                    f'orientation {{x: 0 y: 0 z: {qz:.4f} w: {qw:.4f}}}'
-                )
-                try:
-                    _sp.run(
-                        ["gz", "service",
-                         "-s", "/world/mantis_robot_world/set_pose",
-                         "--reqtype", "gz.msgs.Pose",
-                         "--reptype", "gz.msgs.Boolean",
-                         "--timeout", "120",
-                         "--req", req],
-                        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=0.4,
-                    )
-                except Exception:
-                    pass
+        # Prius and pickup drive their own circles
+        prius = Twist()
+        pickup = Twist()
+        if cars_moving:
+            prius.linear.x = SPEED
+            prius.angular.z = OMEGA
+            pickup.linear.x = SPEED
+            pickup.angular.z = -OMEGA  # opposite turn direction
+        try:
+            car_prius_pub.publish(prius)
+            car_pickup_pub.publish(pickup)
+        except Exception:
+            pass
         time.sleep(0.04)
 
 
