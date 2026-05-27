@@ -117,8 +117,6 @@ pan_pub = node.advertise(PAN_TOPIC, Double)
 tilt_pub = node.advertise(TILT_TOPIC, Double)
 paint_pub = node.advertise(PAINT_TOPIC, Int32)
 moving_target_pub = node.advertise("/moving_target/cmd_vel", Twist)
-moving_car_a_pub = node.advertise("/moving_car_a/cmd_vel", Twist)
-moving_car_b_pub = node.advertise("/moving_car_b/cmd_vel", Twist)
 
 latest_raw: np.ndarray | None = None
 latest_annotated: bytes | None = None
@@ -518,8 +516,22 @@ def resolve_selected_target() -> Detection | None:
         for d in strong:
             if d.det_id == selected_id:
                 return d
+        # ID lost: PREFER same-name + close to (anchor + predicted velocity).
+        # Velocity prediction matters a lot for fast movers — without it the
+        # sibling-vehicle just sitting at the OLD anchor location wins.
         if selected_anchor_xy and strong:
-            ax, ay = selected_anchor_xy
+            ax_raw, ay_raw = selected_anchor_xy
+            dt_lost = max(0.0, time.time() - last_target_seen_ts) if last_target_seen_ts else 0.0
+            ax = ax_raw + target_vx_pix_s * dt_lost
+            ay = ay_raw + target_vy_pix_s * dt_lost
+            if selected_name is not None:
+                same_name = [d for d in strong if d.name == selected_name]
+                if same_name:
+                    best = _nearest_to_anchor(same_name, ax, ay)
+                    bcx = (best.bbox[0] + best.bbox[2]) / 2
+                    bcy = (best.bbox[1] + best.bbox[3]) / 2
+                    if math.hypot(bcx - ax, bcy - ay) <= MAX_ANCHOR_REASSOC_PX:
+                        return best
             best = _nearest_to_anchor(strong, ax, ay)
             bcx = (best.bbox[0] + best.bbox[2]) / 2
             bcy = (best.bbox[1] + best.bbox[3]) / 2
@@ -608,9 +620,12 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
         return
 
     last_target_ts = now
-    # Only update the selected_id when we got a REAL detection (score>0), not
-    # a forward-filled ghost.
-    if target.score > 0:
+    # Only update the selected_id when we got a REAL detection (score>0) AND
+    # ByteTrack still has the same ID. If we matched via spatial fallback the
+    # returned bbox may belong to a SIBLING (e.g. another car nearby) — keep
+    # the original selected_id so when ByteTrack reacquires we snap back to
+    # the real target, not to whichever sibling we picked.
+    if target.score > 0 and (selected_id is None or target.det_id == selected_id):
         selected_id = target.det_id
 
     x1, y1, x2, y2 = target.bbox
@@ -977,15 +992,21 @@ cars_moving = False
 
 
 def _moving_target_loop():
-    """Yellow sphere bounces up and down in place + two box-cars drive
-    back-and-forth across the field of view when toggled. Tests dynamic
-    tracking against both small predictable motion and larger
-    cross-frame translation."""
+    """Yellow sphere bounces up and down in place + the two stock Fuel
+    vehicles (prius + pickup) drive around a circle ~28 m in front of
+    the mantis when toggled. Moves them via the world set_pose service
+    so the fuel models don't need any custom plugin."""
     import math as _m
+    import subprocess as _sp
+    CAR_NAMES = ("car_prius_front", "car_pickup_right")
+    CIRCLE_CX, CIRCLE_CY = 26.0, 4.0       # ~28 m in front of mantis at (0,-8)
+    CIRCLE_R = 12.0
+    PERIOD_S = 22.0
     t0 = time.time()
+    last_pose_pub = 0.0
     while True:
         t = time.time() - t0
-        # Yellow bouncing ball
+        # Yellow bouncing ball over Twist topic
         ball = Twist()
         if target_moving:
             ball.linear.z = 2.5 * _m.sin(2.0 * t)
@@ -993,21 +1014,34 @@ def _moving_target_loop():
             moving_target_pub.publish(ball)
         except Exception:
             pass
-        # Two cars: A drives back-and-forth along +X, B in the opposite
-        # phase, both with a slight Y wander so the camera sees lateral
-        # motion in image space.
-        car_a = Twist()
-        car_b = Twist()
-        if cars_moving:
-            car_a.linear.x = 3.5 * _m.sin(0.35 * t)
-            car_a.linear.y = 0.8 * _m.cos(0.45 * t)
-            car_b.linear.x = -3.0 * _m.sin(0.30 * t + 1.0)
-            car_b.linear.y = 0.6 * _m.sin(0.50 * t)
-        try:
-            moving_car_a_pub.publish(car_a)
-            moving_car_b_pub.publish(car_b)
-        except Exception:
-            pass
+        # Circle the cars at 5 Hz via the world set_pose service
+        if cars_moving and (time.time() - last_pose_pub) > 0.18:
+            last_pose_pub = time.time()
+            phase = 2.0 * _m.pi * (t % PERIOD_S) / PERIOD_S
+            for i, name in enumerate(CAR_NAMES):
+                theta = phase + i * _m.pi  # opposite sides of the circle
+                x = CIRCLE_CX + CIRCLE_R * _m.cos(theta)
+                y = CIRCLE_CY + CIRCLE_R * _m.sin(theta)
+                yaw = theta + _m.pi / 2.0   # face tangent
+                qz = _m.sin(yaw / 2.0)
+                qw = _m.cos(yaw / 2.0)
+                req = (
+                    f'name: "{name}" '
+                    f'position {{x: {x:.3f} y: {y:.3f} z: 0.03}} '
+                    f'orientation {{x: 0 y: 0 z: {qz:.4f} w: {qw:.4f}}}'
+                )
+                try:
+                    _sp.run(
+                        ["gz", "service",
+                         "-s", "/world/mantis_robot_world/set_pose",
+                         "--reqtype", "gz.msgs.Pose",
+                         "--reptype", "gz.msgs.Boolean",
+                         "--timeout", "120",
+                         "--req", req],
+                        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=0.4,
+                    )
+                except Exception:
+                    pass
         time.sleep(0.04)
 
 
