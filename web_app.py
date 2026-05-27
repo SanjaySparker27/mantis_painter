@@ -105,9 +105,9 @@ class Gains:
 # Verified by scripts/auto_tune_trial.py over multiple iterations: this set
 # gave SS ex=+0.005±0.004 / ey=+0.006±0.006 (sub-pixel jitter on the car
 # target) and lock in ~1.8 s with no oscillation or divergence at zoom=1.
-pan_gains = Gains(kp=0.50, ki=0.18, kd=0.14, max_rate_deg_s=35.0,
+pan_gains = Gains(kp=0.55, ki=0.20, kd=0.15, max_rate_deg_s=55.0,
                   integral_clamp_deg=4.0, deadband_norm=0.008)
-tilt_gains = Gains(kp=0.50, ki=0.18, kd=0.14, max_rate_deg_s=26.0,
+tilt_gains = Gains(kp=0.55, ki=0.20, kd=0.15, max_rate_deg_s=40.0,
                    integral_clamp_deg=3.0, deadband_norm=0.012)
 
 
@@ -146,6 +146,17 @@ last_target_seen_ts = 0.0
 smoothed_cx = 0.0
 smoothed_cy = 0.0
 smoothed_init = False
+selected_signature: np.ndarray | None = None   # HSV histogram of the selected bbox
+
+# Motion model in joint-bearing space — used to actively pursue the target
+# through detection gaps instead of freezing the camera.
+target_world_pan_deg: float | None = None
+target_world_tilt_deg: float | None = None
+target_pan_rate_deg_s: float = 0.0
+target_tilt_rate_deg_s: float = 0.0
+last_bearing_ts: float = 0.0
+PURSUIT_DECAY_S = 1.8    # bearing-velocity decay constant during loss
+PURSUIT_MAX_S = 4.0      # stop extrapolating after this long
 last_target_w = 60.0
 last_target_h = 60.0
 PERSIST_HORIZON_S = 3.0  # forward-fill detection up to this long after a miss
@@ -443,9 +454,18 @@ def reset_controller_state() -> None:
 def clear_selection() -> None:
     global selected_id, selected_name, selected_anchor_xy
     global smoothed_init, target_vx_pix_s, target_vy_pix_s, last_target_seen_ts
+    global selected_signature
+    global target_world_pan_deg, target_world_tilt_deg
+    global target_pan_rate_deg_s, target_tilt_rate_deg_s, last_bearing_ts
+    target_world_pan_deg = None
+    target_world_tilt_deg = None
+    target_pan_rate_deg_s = 0.0
+    target_tilt_rate_deg_s = 0.0
+    last_bearing_ts = 0.0
     selected_id = None
     selected_name = None
     selected_anchor_xy = None
+    selected_signature = None
     smoothed_init = False
     target_vx_pix_s = 0.0
     target_vy_pix_s = 0.0
@@ -490,6 +510,51 @@ def _nearest_to_anchor(cands, ax, ay):
         ((d.bbox[0] + d.bbox[2]) / 2 - ax) ** 2
         + ((d.bbox[1] + d.bbox[3]) / 2 - ay) ** 2
     ))
+
+
+def _hsv_signature_from_bbox(frame: np.ndarray, bbox) -> np.ndarray | None:
+    if frame is None:
+        return None
+    h, w = frame.shape[:2]
+    x1 = max(0, int(bbox[0])); y1 = max(0, int(bbox[1]))
+    x2 = min(w, int(bbox[2])); y2 = min(h, int(bbox[3]))
+    if x2 - x1 < 6 or y2 - y1 < 6:
+        return None
+    roi = frame[y1:y2, x1:x2]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+    cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+    return hist
+
+
+def _signature_distance(sig_a, sig_b) -> float:
+    """Bhattacharyya distance: 0 = identical, 1 = totally different."""
+    if sig_a is None or sig_b is None:
+        return 1.0
+    try:
+        return float(cv2.compareHist(sig_a, sig_b, cv2.HISTCMP_BHATTACHARYYA))
+    except Exception:
+        return 1.0
+
+
+def _candidate_score(d, ax, ay, ref_sig):
+    """Composite score (lower = better) combining anchor distance + bbox-
+    size similarity + HSV histogram match."""
+    cx = (d.bbox[0] + d.bbox[2]) / 2
+    cy = (d.bbox[1] + d.bbox[3]) / 2
+    dist = math.hypot(cx - ax, cy - ay)
+    cand_sig = _hsv_signature_from_bbox(latest_raw, d.bbox)
+    sig_dist = _signature_distance(ref_sig, cand_sig)
+    w = float(d.bbox[2] - d.bbox[0])
+    h = float(d.bbox[3] - d.bbox[1])
+    size_ratio = 1.0
+    if last_target_w > 0 and last_target_h > 0:
+        size_ratio = (
+            min(w, last_target_w) / max(w, last_target_w)
+            * min(h, last_target_h) / max(h, last_target_h)
+        )
+    # weights tuned so signature dominates when distances are similar
+    return dist + 800.0 * sig_dist + 200.0 * (1.0 - size_ratio)
 
 
 def _bbox_size_similar(d) -> bool:
@@ -564,34 +629,17 @@ def resolve_selected_target() -> Detection | None:
                     same_name = [d for d in strong if d.name == selected_name
                                  and _bbox_size_similar(d)]
                 if same_name:
-                    # Sort by distance to predicted anchor. Accept the
-                    # nearest only if it is unambiguously closer than the
-                    # second-nearest — otherwise hold ghost rather than
-                    # gamble between two same-class siblings.
-                    same_name.sort(key=lambda d: (
-                        ((d.bbox[0] + d.bbox[2]) / 2 - ax) ** 2
-                        + ((d.bbox[1] + d.bbox[3]) / 2 - ay) ** 2
-                    ))
+                    # Rank by composite (anchor distance + signature + size).
+                    # Then re-check anchor distance against the gate.
+                    same_name.sort(
+                        key=lambda d: _candidate_score(d, ax, ay, selected_signature)
+                    )
                     best = same_name[0]
                     bcx = (best.bbox[0] + best.bbox[2]) / 2
                     bcy = (best.bbox[1] + best.bbox[3]) / 2
                     d_best = math.hypot(bcx - ax, bcy - ay)
                     if d_best <= name_gate:
-                        if len(same_name) >= 2:
-                            second = same_name[1]
-                            scx = (second.bbox[0] + second.bbox[2]) / 2
-                            scy = (second.bbox[1] + second.bbox[3]) / 2
-                            d_second = math.hypot(scx - ax, scy - ay)
-                            # require best to be at least 1.6x closer than
-                            # second-best; otherwise the situation is too
-                            # ambiguous and we'd risk locking onto the wrong
-                            # sibling.
-                            if d_second < d_best * AMBIGUITY_MARGIN and not in_zoom_grace:
-                                pass  # ambiguous — fall through to ghost
-                            else:
-                                return best
-                        else:
-                            return best
+                        return best
             cross = strong if in_zoom_grace else [d for d in strong if _bbox_size_similar(d)]
             if cross:
                 best = _nearest_to_anchor(cross, ax, ay)
@@ -609,8 +657,15 @@ def resolve_selected_target() -> Detection | None:
         if selected_name is not None and strong:
             dt_lost = (time.time() - last_target_seen_ts) if last_target_seen_ts else 0.0
             if dt_lost <= LONG_LOST_REACQUIRE_S:
-                same_name_any = [d for d in strong if d.name == selected_name
-                                 and _bbox_size_similar(d)]
+                same_name_any = [d for d in strong if d.name == selected_name]
+                if same_name_any and selected_signature is not None:
+                    # Pick the same-name candidate with the closest HSV
+                    # signature to the locked target. Distance is irrelevant
+                    # in long-lost: target may be anywhere in the frame.
+                    same_name_any.sort(key=lambda d: _signature_distance(
+                        selected_signature,
+                        _hsv_signature_from_bbox(latest_raw, d.bbox)))
+                    return same_name_any[0]
                 if same_name_any:
                     same_name_any.sort(key=lambda d: -d.score)
                     return same_name_any[0]
@@ -660,6 +715,8 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     global selected_anchor_xy, sweep_last_advance_ts
     global last_target_cx, last_target_cy, last_target_seen_ts
     global target_vx_pix_s, target_vy_pix_s
+    global target_world_pan_deg, target_world_tilt_deg
+    global target_pan_rate_deg_s, target_tilt_rate_deg_s, last_bearing_ts
 
     now = time.time()
     target = resolve_selected_target()
@@ -671,11 +728,35 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
         last_ey_norm *= 0.5
         target_vx_pix_s *= 0.5
         target_vy_pix_s *= 0.5
-        # If we still have a selection, freeze the joint at its current
-        # commanded angle (no drift back to home) so the camera holds the
-        # last sight line until detection recovers. NEVER auto-clear the
-        # selection — the user keeps full authority via the Clear button.
+        # Active pursuit through detection gaps: extrapolate target bearing
+        # using its last-known rate, decay over time. NEVER auto-clear —
+        # user keeps authority via the Clear button.
         if (selected_name is not None or selected_id is not None):
+            if (target_world_pan_deg is not None
+                    and last_bearing_ts > 0):
+                dt_lost = now - last_bearing_ts
+                if dt_lost <= PURSUIT_MAX_S:
+                    decay = math.exp(-dt_lost / PURSUIT_DECAY_S)
+                    pred_pan = (target_world_pan_deg
+                                + target_pan_rate_deg_s * dt_lost * decay)
+                    pred_tilt = (target_world_tilt_deg
+                                 + target_tilt_rate_deg_s * dt_lost * decay)
+                    pred_pan = clamp(pred_pan, PAN_LIMIT[0], PAN_LIMIT[1])
+                    pred_tilt = clamp(pred_tilt, TILT_LIMIT[0], TILT_LIMIT[1])
+                    pan_max_step = pan_gains.max_rate_deg_s * dt
+                    tilt_max_step = tilt_gains.max_rate_deg_s * dt
+                    actual_p = actual_pan_deg if joint_state_stamp else pan_deg
+                    actual_t = actual_tilt_deg if joint_state_stamp else tilt_deg
+                    pan_step = clamp(pred_pan - pan_deg, -pan_max_step, pan_max_step)
+                    tilt_step = clamp(pred_tilt - tilt_deg, -tilt_max_step, tilt_max_step)
+                    pan_deg = clamp(pan_deg + 0.35 * pan_step,
+                                    PAN_LIMIT[0], PAN_LIMIT[1])
+                    tilt_deg = clamp(tilt_deg + 0.35 * tilt_step,
+                                     TILT_LIMIT[0], TILT_LIMIT[1])
+                    publish_pan_tilt()
+                    centered_frames = 0
+                    return
+            # No motion model yet, or pursuit window expired — freeze.
             publish_pan_tilt()
             centered_frames = 0
             return
@@ -714,10 +795,17 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
         if selected_id is None or target.det_id == selected_id:
             selected_id = target.det_id
         elif not id_in_frame and target.name == selected_name:
-            # Persistent re-bind: our ByteTrack ID is gone from the frame
-            # entirely AND the resolver handed us a same-name candidate
-            # (the long-lost-reacquire path) — adopt its new ID.
             selected_id = target.det_id
+        # Slowly refresh the HSV signature so it tracks gradual
+        # appearance change (shadow, viewing angle) without snapping to
+        # a sibling on a single bad frame.
+        global selected_signature
+        new_sig = _hsv_signature_from_bbox(latest_raw, target.bbox)
+        if new_sig is not None:
+            if selected_signature is None:
+                selected_signature = new_sig
+            else:
+                selected_signature = 0.85 * selected_signature + 0.15 * new_sig
 
     x1, y1, x2, y2 = target.bbox
     cx_raw = (x1 + x2) / 2.0
@@ -824,6 +912,24 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
 
     desired_pan = actual_pan + PAN_SIGN * pan_u_deg
     desired_tilt = actual_tilt + TILT_SIGN * tilt_u_deg
+
+    # Motion-model update: world bearing of the target = actual joint angle
+    # plus the angular offset corresponding to its pixel error. Track its
+    # rate so pursuit can continue when the bbox briefly vanishes.
+    if target.score > 0:
+        new_world_pan = actual_pan + PAN_SIGN * pan_err_deg
+        new_world_tilt = actual_tilt + TILT_SIGN * tilt_err_deg
+        now_bts = time.time()
+        if target_world_pan_deg is not None and last_bearing_ts > 0:
+            dt_b = max(1e-3, now_bts - last_bearing_ts)
+            raw_pan_rate = (new_world_pan - target_world_pan_deg) / dt_b
+            raw_tilt_rate = (new_world_tilt - target_world_tilt_deg) / dt_b
+            beta = 0.30
+            target_pan_rate_deg_s = (1 - beta) * target_pan_rate_deg_s + beta * raw_pan_rate
+            target_tilt_rate_deg_s = (1 - beta) * target_tilt_rate_deg_s + beta * raw_tilt_rate
+        target_world_pan_deg = new_world_pan
+        target_world_tilt_deg = new_world_tilt
+        last_bearing_ts = now_bts
 
     # Rate limit + low-pass filter on outgoing command for smooth motion.
     # At higher zoom the effective FOV shrinks. A normal max_rate would slew
@@ -1106,8 +1212,8 @@ def _moving_target_loop():
     """
     import math as _m
     CIRCLE_R = 10.0
-    SPEED = 3.5                 # m/s tangential — calm cruise
-    OMEGA = SPEED / CIRCLE_R    # yaw rate so the body draws the circle
+    SPEED = 1.6                 # m/s tangential — slow enough for the camera to follow
+    OMEGA = SPEED / CIRCLE_R
     t0 = time.time()
     while True:
         t = time.time() - t0
@@ -1797,9 +1903,11 @@ def api_select():
         jog_pan_target = None
         jog_tilt_target = None
         x1, y1, x2, y2 = hit.bbox
+        global selected_signature
         selected_id = hit.det_id
         selected_name = hit.name
         selected_anchor_xy = ((x1 + x2) / 2, (y1 + y2) / 2)
+        selected_signature = _hsv_signature_from_bbox(latest_raw, hit.bbox)
         mode = "auto"
     return jsonify({"ok": True, "selected_id": selected_id,
                     "selected_name": selected_name, "mode": mode})
@@ -1826,10 +1934,12 @@ def api_select_detection():
             tilt_deg = actual_tilt_deg
         jog_pan_target = None
         jog_tilt_target = None
+        global selected_signature
         selected_id = hit.det_id
         selected_name = hit.name
         x1, y1, x2, y2 = hit.bbox
         selected_anchor_xy = ((x1 + x2) / 2, (y1 + y2) / 2)
+        selected_signature = _hsv_signature_from_bbox(latest_raw, hit.bbox)
         mode = "auto"
     return jsonify({"ok": True, "selected_id": selected_id,
                     "selected_name": selected_name, "mode": mode})
