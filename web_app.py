@@ -148,6 +148,63 @@ smoothed_cy = 0.0
 smoothed_init = False
 selected_signature: np.ndarray | None = None   # HSV histogram of the selected bbox
 
+
+class TargetKF:
+    """Constant-velocity Kalman filter on (cx, cy) bbox center in image
+    pixels. State = [cx, cy, vx_px_s, vy_px_s]."""
+
+    def __init__(self, cx: float, cy: float):
+        self.x = np.array([cx, cy, 0.0, 0.0], dtype=float)
+        self.P = np.eye(4, dtype=float) * 200.0
+        # Process noise — higher for velocity means we trust new
+        # measurements more after sudden direction changes.
+        self.Q = np.diag([4.0, 4.0, 80.0, 80.0]).astype(float)
+        # Measurement noise — YOLO bbox center jitter ~4 px.
+        self.R = np.diag([16.0, 16.0]).astype(float)
+        self.last_ts = time.time()
+
+    def predict(self, now: float | None = None) -> None:
+        now = now if now is not None else time.time()
+        dt = max(1e-3, min(0.5, now - self.last_ts))
+        self.last_ts = now
+        F = np.array([
+            [1.0, 0.0, dt, 0.0],
+            [0.0, 1.0, 0.0, dt],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ])
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + self.Q
+
+    def update(self, cx: float, cy: float) -> None:
+        H = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+        z = np.array([cx, cy])
+        y = z - H @ self.x
+        S = H @ self.P @ H.T + self.R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.P = (np.eye(4) - K @ H) @ self.P
+
+    def position(self) -> tuple[float, float]:
+        return float(self.x[0]), float(self.x[1])
+
+    def velocity(self) -> tuple[float, float]:
+        return float(self.x[2]), float(self.x[3])
+
+    def mahalanobis(self, cx: float, cy: float) -> float:
+        H = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+        S = H @ self.P @ H.T + self.R
+        z = np.array([cx, cy]) - H @ self.x
+        try:
+            Si = np.linalg.inv(S)
+        except np.linalg.LinAlgError:
+            return float("inf")
+        return float(z @ Si @ z)
+
+
+selected_kf: TargetKF | None = None
+KF_MAHA_GATE = 25.0   # max Mahalanobis^2 distance for accepting a measurement
+
 # Motion model in joint-bearing space — used to actively pursue the target
 # through detection gaps instead of freezing the camera.
 target_world_pan_deg: float | None = None
@@ -454,7 +511,7 @@ def reset_controller_state() -> None:
 def clear_selection() -> None:
     global selected_id, selected_name, selected_anchor_xy
     global smoothed_init, target_vx_pix_s, target_vy_pix_s, last_target_seen_ts
-    global selected_signature
+    global selected_signature, selected_kf
     global target_world_pan_deg, target_world_tilt_deg
     global target_pan_rate_deg_s, target_tilt_rate_deg_s, last_bearing_ts
     target_world_pan_deg = None
@@ -462,6 +519,7 @@ def clear_selection() -> None:
     target_pan_rate_deg_s = 0.0
     target_tilt_rate_deg_s = 0.0
     last_bearing_ts = 0.0
+    selected_kf = None
     selected_id = None
     selected_name = None
     selected_anchor_xy = None
@@ -595,15 +653,38 @@ def _ghost_target() -> Detection | None:
 def resolve_selected_target() -> Detection | None:
     if selected_name is None and selected_id is None:
         return None
-    # If the current frame has no detections at all but we have a very fresh
-    # recent_detections cache, search there first — bridges one-frame YOLO
-    # drops without falling into ghost mode.
     pool = detections
     if not pool and (time.time() - recent_detection_stamp) < 0.4:
         pool = recent_detections
     strong = [d for d in pool if d.score >= MIN_TRACK_SCORE]
     if not strong:
         strong = list(pool)
+
+    # Advance Kalman prediction to NOW so we score against where the target
+    # is expected to be this frame.
+    if selected_kf is not None:
+        selected_kf.predict()
+
+    # Pre-flight: when ByteTrack still has the locked ID, do a Mahalanobis
+    # sanity check + signature check. Only reject the in-frame match if it
+    # is wildly inconsistent with the Kalman track AND the appearance has
+    # changed — that pattern is YOLO putting our ID on a different physical
+    # object (rare but happens).
+    if detector_mode == "auto" and selected_id is not None:
+        same_id = next((d for d in strong if d.det_id == selected_id), None)
+        if same_id is not None:
+            if selected_kf is not None:
+                cx = (same_id.bbox[0] + same_id.bbox[2]) / 2
+                cy = (same_id.bbox[1] + same_id.bbox[3]) / 2
+                m = selected_kf.mahalanobis(cx, cy)
+                if m > 200.0:
+                    # ID was reassigned to a far-off object. Fall through to
+                    # candidate search.
+                    pass
+                else:
+                    return same_id
+            else:
+                return same_id
 
     # During the ZOOM_GRACE window right after a zoom change, ByteTrack is
     # likely to have dropped the ID and the bbox geometry is in a new scale,
@@ -614,32 +695,47 @@ def resolve_selected_target() -> Detection | None:
     cross_gate = (MAX_ANCHOR_REASSOC_CROSS_CLASS_PX * 2.0) if in_zoom_grace else MAX_ANCHOR_REASSOC_CROSS_CLASS_PX
 
     if detector_mode == "auto" and selected_id is not None:
-        for d in strong:
-            if d.det_id == selected_id:
-                return d
-        if selected_anchor_xy and strong:
-            ax_raw, ay_raw = selected_anchor_xy
-            dt_lost = max(0.0, time.time() - last_target_seen_ts) if last_target_seen_ts else 0.0
-            ax = ax_raw + target_vx_pix_s * dt_lost
-            ay = ay_raw + target_vy_pix_s * dt_lost
+        if selected_kf is not None:
+            ax, ay = selected_kf.position()
+        elif selected_anchor_xy:
+            ax, ay = selected_anchor_xy
+        else:
+            ax, ay = IMG_W / 2.0, IMG_H / 2.0
+
+        if strong:
+            # Pass 1: candidates with similar HSV signature, regardless of
+            # YOLO class label. Distant cars often get mis-classified as
+            # 'truck' or 'airplane' so we can't rely on class alone.
+            sig_ranked = sorted(
+                strong,
+                key=lambda d: _signature_distance(
+                    selected_signature,
+                    _hsv_signature_from_bbox(latest_raw, d.bbox)),
+            )
+            for cand in sig_ranked[:3]:
+                cx = (cand.bbox[0] + cand.bbox[2]) / 2
+                cy = (cand.bbox[1] + cand.bbox[3]) / 2
+                sig_d = _signature_distance(
+                    selected_signature,
+                    _hsv_signature_from_bbox(latest_raw, cand.bbox))
+                m = (selected_kf.mahalanobis(cx, cy)
+                     if selected_kf is not None else 0.0)
+                # Accept if signature is close AND Kalman gate passes.
+                if sig_d < 0.45 and m <= KF_MAHA_GATE:
+                    return cand
+            # Pass 2: same name + within spatial gate
             if selected_name is not None:
-                if in_zoom_grace:
-                    same_name = [d for d in strong if d.name == selected_name]
-                else:
-                    same_name = [d for d in strong if d.name == selected_name
-                                 and _bbox_size_similar(d)]
+                same_name = [d for d in strong if d.name == selected_name]
                 if same_name:
-                    # Rank by composite (anchor distance + signature + size).
-                    # Then re-check anchor distance against the gate.
                     same_name.sort(
                         key=lambda d: _candidate_score(d, ax, ay, selected_signature)
                     )
                     best = same_name[0]
                     bcx = (best.bbox[0] + best.bbox[2]) / 2
                     bcy = (best.bbox[1] + best.bbox[3]) / 2
-                    d_best = math.hypot(bcx - ax, bcy - ay)
-                    if d_best <= name_gate:
+                    if math.hypot(bcx - ax, bcy - ay) <= name_gate:
                         return best
+            # Pass 3: any class within tight spatial gate
             cross = strong if in_zoom_grace else [d for d in strong if _bbox_size_similar(d)]
             if cross:
                 best = _nearest_to_anchor(cross, ax, ay)
@@ -796,6 +892,13 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
             selected_id = target.det_id
         elif not id_in_frame and target.name == selected_name:
             selected_id = target.det_id
+        # Feed measurement to Kalman so the prediction snaps to the
+        # observed position. Resolver will use the updated prediction
+        # next frame.
+        if selected_kf is not None:
+            cx_meas = (target.bbox[0] + target.bbox[2]) / 2
+            cy_meas = (target.bbox[1] + target.bbox[3]) / 2
+            selected_kf.update(cx_meas, cy_meas)
         # Slowly refresh the HSV signature so it tracks gradual
         # appearance change (shadow, viewing angle) without snapping to
         # a sibling on a single bad frame.
@@ -1903,11 +2006,13 @@ def api_select():
         jog_pan_target = None
         jog_tilt_target = None
         x1, y1, x2, y2 = hit.bbox
-        global selected_signature
+        global selected_signature, selected_kf
         selected_id = hit.det_id
         selected_name = hit.name
-        selected_anchor_xy = ((x1 + x2) / 2, (y1 + y2) / 2)
+        ax = (x1 + x2) / 2; ay = (y1 + y2) / 2
+        selected_anchor_xy = (ax, ay)
         selected_signature = _hsv_signature_from_bbox(latest_raw, hit.bbox)
+        selected_kf = TargetKF(ax, ay)
         mode = "auto"
     return jsonify({"ok": True, "selected_id": selected_id,
                     "selected_name": selected_name, "mode": mode})
@@ -1934,12 +2039,14 @@ def api_select_detection():
             tilt_deg = actual_tilt_deg
         jog_pan_target = None
         jog_tilt_target = None
-        global selected_signature
+        global selected_signature, selected_kf
         selected_id = hit.det_id
         selected_name = hit.name
         x1, y1, x2, y2 = hit.bbox
-        selected_anchor_xy = ((x1 + x2) / 2, (y1 + y2) / 2)
+        ax = (x1 + x2) / 2; ay = (y1 + y2) / 2
+        selected_anchor_xy = (ax, ay)
         selected_signature = _hsv_signature_from_bbox(latest_raw, hit.bbox)
+        selected_kf = TargetKF(ax, ay)
         mode = "auto"
     return jsonify({"ok": True, "selected_id": selected_id,
                     "selected_name": selected_name, "mode": mode})

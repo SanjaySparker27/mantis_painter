@@ -21,15 +21,18 @@ Top: blue = pan (cmd solid, actual dashed). Red = tilt (same). Bottom: normalize
 
 ## What kind of tracking is this?
 
-Object-level tracking, not blind pixel tracking.
+Object-level tracking with a per-target identity stack — not blind pixel tracking.
 
 | layer | what it does | implementation |
 |---|---|---|
-| Detection | finds what objects are in the frame | **OpenCV HSV color masks** (red, blue, green, yellow, cyan, magenta, orange, brown, teal, purple) **or YOLOv12n** (`ultralytics`) on the same frame |
-| Track association | keeps a stable identity for the same object across frames | **ByteTrack** (Kalman filter + IoU association) for YOLO mode; **name + nearest-bbox-anchor** with a 240 px gate for color mode |
-| Pose control | converts bbox-center pixel error to a joint-angle command | FOV-aware mapping `θ = atan(tan(FOV/2) · n)`, cascaded outer PID on the **actual** joint state, inner Gazebo `JointPositionController` |
+| Detection | finds objects in the frame | **OpenCV HSV color masks** OR **YOLOv12n** (`ultralytics`) |
+| Track association | maintains stable identity across frames | **ByteTrack** for YOLO; name+anchor for color |
+| **Per-target Kalman** | predicts where the selected target will be next frame | 4D state `[cx, cy, vx_px_s, vy_px_s]` constant-velocity model, Bhattacharyya gate |
+| **HSV histogram signature** | discriminates the locked target from same-class siblings | 16×16 hue/saturation histogram snapshot at select-time, EMA-refreshed on each real match |
+| **Motion-model pursuit** | drives the camera through detection gaps | `target_world_pan/tilt_deg` + EMA-estimated bearing rate, exponentially decayed (`τ = 1.8 s`, `max = 4 s`) |
+| Pose control | converts bbox-center pixel error to a joint-angle command | FOV-aware `θ = atan(tan(FOV/2) · n)`, cascaded outer PID on **actual** joint state, inner Gazebo `JointPositionController` |
 
-So the controller does not chase a pixel — it chases a *tracked object*. If the bbox jitters by 5 px the smoothed center barely moves; if YOLO swaps the IDs of two cars, ByteTrack keeps the one you clicked.
+**Result:** if YOLO drops the ByteTrack ID, the resolver picks the candidate whose HSV signature is closest to the locked target AND whose position falls inside the Kalman gate. Same-name fallback uses a composite score `anchor_dist + 800·sig_dist + 200·(1 − size_ratio)`. Long-lost re-acquire window is **120 s** so a target that drives out of view for two minutes is still remembered.
 
 ## Features
 
