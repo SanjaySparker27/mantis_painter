@@ -119,8 +119,8 @@ paint_pub = node.advertise(PAINT_TOPIC, Int32)
 moving_target_pub = node.advertise("/moving_target/cmd_vel", Twist)
 car_prius_pub = node.advertise("/car_prius_front/cmd_vel", Twist)
 car_pickup_pub = node.advertise("/car_pickup_right/cmd_vel", Twist)
-person_left_pub = node.advertise("/person_left/cmd_vel", Twist)
-person_b_pub = node.advertise("/person_b/cmd_vel", Twist)
+ball_red_pub = node.advertise("/ball_red/cmd_vel", Twist)
+ball_green_pub = node.advertise("/ball_green/cmd_vel", Twist)
 
 latest_raw: np.ndarray | None = None
 latest_annotated: bytes | None = None
@@ -207,7 +207,7 @@ def _load_painted_memory():
 
 _load_painted_memory()
 
-LOST_GRACE_S = 2.0  # keep selection alive longer when YOLO loses confidence briefly
+LOST_GRACE_S = 6.0  # hold selection through long detection gaps (don't drop to home)
 
 YOLO_WEIGHTS_TRY = [
     "yolo12n.pt",
@@ -550,20 +550,40 @@ def resolve_selected_target() -> Detection | None:
             ax = ax_raw + target_vx_pix_s * dt_lost
             ay = ay_raw + target_vy_pix_s * dt_lost
             if selected_name is not None:
-                # Inside zoom-grace skip the size-similarity filter — the
-                # newly-detected bbox is at the new zoom scale and won't
-                # match the pre-zoom size.
                 if in_zoom_grace:
                     same_name = [d for d in strong if d.name == selected_name]
                 else:
                     same_name = [d for d in strong if d.name == selected_name
                                  and _bbox_size_similar(d)]
                 if same_name:
-                    best = _nearest_to_anchor(same_name, ax, ay)
+                    # Sort by distance to predicted anchor. Accept the
+                    # nearest only if it is unambiguously closer than the
+                    # second-nearest — otherwise hold ghost rather than
+                    # gamble between two same-class siblings.
+                    same_name.sort(key=lambda d: (
+                        ((d.bbox[0] + d.bbox[2]) / 2 - ax) ** 2
+                        + ((d.bbox[1] + d.bbox[3]) / 2 - ay) ** 2
+                    ))
+                    best = same_name[0]
                     bcx = (best.bbox[0] + best.bbox[2]) / 2
                     bcy = (best.bbox[1] + best.bbox[3]) / 2
-                    if math.hypot(bcx - ax, bcy - ay) <= name_gate:
-                        return best
+                    d_best = math.hypot(bcx - ax, bcy - ay)
+                    if d_best <= name_gate:
+                        if len(same_name) >= 2:
+                            second = same_name[1]
+                            scx = (second.bbox[0] + second.bbox[2]) / 2
+                            scy = (second.bbox[1] + second.bbox[3]) / 2
+                            d_second = math.hypot(scx - ax, scy - ay)
+                            # require best to be at least 1.6x closer than
+                            # second-best; otherwise the situation is too
+                            # ambiguous and we'd risk locking onto the wrong
+                            # sibling.
+                            if d_second < d_best * 1.6 and not in_zoom_grace:
+                                pass  # ambiguous — fall through to ghost
+                            else:
+                                return best
+                        else:
+                            return best
             cross = strong if in_zoom_grace else [d for d in strong if _bbox_size_similar(d)]
             if cross:
                 best = _nearest_to_anchor(cross, ax, ay)
@@ -628,6 +648,15 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
         last_ey_norm *= 0.5
         target_vx_pix_s *= 0.5
         target_vy_pix_s *= 0.5
+        # If we still have a selection, freeze the joint at its current
+        # commanded angle (no drift back to home) so the camera holds the
+        # last observation until detection recovers.
+        if (selected_name is not None or selected_id is not None):
+            publish_pan_tilt()
+            if last_target_ts and now - last_target_ts > LOST_GRACE_S:
+                clear_selection()
+            centered_frames = 0
+            return
         if selected_name is None and selected_id is None:
             # Sweep mode: when idle, pick the first not-yet-painted detection.
             if sweep_enabled:
@@ -1072,20 +1101,18 @@ def _moving_target_loop():
             car_pickup_pub.publish(pickup)
         except Exception:
             pass
-        # Walking people: slow forward (1.2 m/s) + slow turn so each draws
-        # a larger calm circle than the cars. They use the standing-person
-        # mesh — no leg animation, just translation — but YOLO still
-        # detects them as "person" each frame.
-        p_left = Twist()
-        p_right = Twist()
+        # Two extra colored spheres bounce in place at distinct frequencies.
+        # Replaces the standing-person models (which fall over under
+        # VelocityControl). YOLO detects these reliably as 'sports ball'
+        # so they give us a second tracking class to test against.
+        r = Twist()
+        g = Twist()
         if people_walking:
-            p_left.linear.x = 1.2
-            p_left.angular.z = 0.20
-            p_right.linear.x = 1.2
-            p_right.angular.z = -0.20
+            r.linear.z = 2.0 * _m.sin(1.7 * t)
+            g.linear.z = 2.2 * _m.sin(2.3 * t + 1.0)
         try:
-            person_left_pub.publish(p_left)
-            person_b_pub.publish(p_right)
+            ball_red_pub.publish(r)
+            ball_green_pub.publish(g)
         except Exception:
             pass
         time.sleep(0.04)

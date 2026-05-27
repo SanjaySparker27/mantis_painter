@@ -116,14 +116,19 @@
       <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/pickup/4</uri>
     </include>
 
-    <include>
-      <name>person_b</name>
-      <pose>40 -2 0.0 0 0 -1.5708</pose>
-      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/standing%20person/3</uri>
+    <model name="ball_green">
+      <pose>22 8 1.0 0 0 0</pose>
+      <link name="link">
+        <inertial><mass>1.5</mass><inertia><ixx>0.15</ixx><iyy>0.15</iyy><izz>0.15</izz></inertia></inertial>
+        <visual name="v">
+          <geometry><sphere><radius>0.55</radius></sphere></geometry>
+          <material><ambient>0.10 0.85 0.20 1</ambient><diffuse>0.14 0.92 0.25 1</diffuse></material>
+        </visual>
+      </link>
       <plugin filename="gz-sim-velocity-control-system" name="gz::sim::systems::VelocityControl">
-        <topic>person_b/cmd_vel</topic>
+        <topic>ball_green/cmd_vel</topic>
       </plugin>
-    </include>
+    </model>
 
     <include>
       <name>helipad_a</name>
@@ -149,14 +154,19 @@
       <uri>../models/external/x500</uri>
     </include>
 
-    <include>
-      <name>person_left</name>
-      <pose>26 -10 0.0 0 0 0</pose>
-      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/standing%20person/3</uri>
+    <model name="ball_red">
+      <pose>16 -6 1.0 0 0 0</pose>
+      <link name="link">
+        <inertial><mass>1.5</mass><inertia><ixx>0.15</ixx><iyy>0.15</iyy><izz>0.15</izz></inertia></inertial>
+        <visual name="v">
+          <geometry><sphere><radius>0.55</radius></sphere></geometry>
+          <material><ambient>0.92 0.10 0.10 1</ambient><diffuse>0.95 0.14 0.14 1</diffuse></material>
+        </visual>
+      </link>
       <plugin filename="gz-sim-velocity-control-system" name="gz::sim::systems::VelocityControl">
-        <topic>person_left/cmd_vel</topic>
+        <topic>ball_red/cmd_vel</topic>
       </plugin>
-    </include>
+    </model>
 
     <!-- Moving target: a bright orange ball driven on a back-and-forth
          track via the built-in TrajectoryFollower plugin. Tests dynamic
