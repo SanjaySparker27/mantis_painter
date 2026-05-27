@@ -650,11 +650,10 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
         target_vy_pix_s *= 0.5
         # If we still have a selection, freeze the joint at its current
         # commanded angle (no drift back to home) so the camera holds the
-        # last observation until detection recovers.
+        # last sight line until detection recovers. NEVER auto-clear the
+        # selection — the user keeps full authority via the Clear button.
         if (selected_name is not None or selected_id is not None):
             publish_pan_tilt()
-            if last_target_ts and now - last_target_ts > LOST_GRACE_S:
-                clear_selection()
             centered_frames = 0
             return
         if selected_name is None and selected_id is None:
@@ -936,11 +935,18 @@ def draw_overlay(frame: np.ndarray) -> np.ndarray:
                   (80, 220, 255), 1)
     for det in detections:
         x1, y1, x2, y2 = det.bbox
-        is_sel = (det.det_id == selected_id) or (
-            selected_name is not None and det.name == selected_name)
-        color = (0, 215, 255) if is_sel else det.color
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 3 if is_sel else 2)
-        cv2.putText(out, f"ID {det.det_id} {det.name}", (x1, max(24, y1 - 8)),
+        is_sel = (det.det_id == selected_id)
+        if is_sel:
+            color = (0, 0, 255)  # red (BGR) — the actively tracked target
+            thickness = 4
+        else:
+            color = det.color
+            thickness = 2
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
+        label = f"ID {det.det_id} {det.name}"
+        if is_sel:
+            label = "[LOCKED] " + label
+        cv2.putText(out, label, (x1, max(24, y1 - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
     now = time.time()
     for m in list(paint_overlay_marks):
