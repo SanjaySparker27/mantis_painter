@@ -102,10 +102,10 @@ class Gains:
     deadband_norm: float
 
 
-pan_gains = Gains(kp=0.55, ki=0.15, kd=0.12, max_rate_deg_s=45.0,
-                  integral_clamp_deg=3.5, deadband_norm=0.018)
-tilt_gains = Gains(kp=0.55, ki=0.15, kd=0.12, max_rate_deg_s=32.0,
-                   integral_clamp_deg=3.0, deadband_norm=0.022)
+pan_gains = Gains(kp=0.50, ki=0.18, kd=0.14, max_rate_deg_s=35.0,
+                  integral_clamp_deg=4.0, deadband_norm=0.008)
+tilt_gains = Gains(kp=0.50, ki=0.18, kd=0.14, max_rate_deg_s=26.0,
+                   integral_clamp_deg=3.0, deadband_norm=0.012)
 
 
 lock = threading.Lock()
@@ -139,6 +139,9 @@ last_target_seen_ts = 0.0
 smoothed_cx = 0.0
 smoothed_cy = 0.0
 smoothed_init = False
+last_target_w = 60.0
+last_target_h = 60.0
+PERSIST_HORIZON_S = 1.0  # forward-fill detection up to this long after a miss
 pan_i_deg = 0.0
 tilt_i_deg = 0.0
 last_ex_norm = 0.0
@@ -470,6 +473,28 @@ def _nearest_to_anchor(cands, ax, ay):
     ))
 
 
+def _ghost_target() -> Detection | None:
+    """Forward-fill a synthetic Detection that simply HOLDS the last known
+    bbox center. Extrapolating by velocity feeds back into the controller
+    motion and diverges, so we keep the ghost stationary — the controller
+    sees zero error and holds position until a real detection returns."""
+    if not selected_anchor_xy or last_target_seen_ts <= 0:
+        return None
+    dt = time.time() - last_target_seen_ts
+    if dt > PERSIST_HORIZON_S:
+        return None
+    ax, ay = selected_anchor_xy
+    w2 = last_target_w / 2.0
+    h2 = last_target_h / 2.0
+    return Detection(
+        det_id=selected_id if selected_id is not None else -1,
+        name=selected_name or "ghost",
+        bbox=(int(ax - w2), int(ay - h2), int(ax + w2), int(ay + h2)),
+        score=0.0,
+        color=(60, 60, 200),
+    )
+
+
 def resolve_selected_target() -> Detection | None:
     if selected_name is None and selected_id is None:
         return None
@@ -477,10 +502,6 @@ def resolve_selected_target() -> Detection | None:
     if not strong:
         strong = list(detections)
 
-    # YOLO+ByteTrack: prefer stable track ID. If the ID dropped this frame,
-    # fall back to nearest detection (any class) within a tight radius —
-    # rescues us when YOLO flips 'car' <-> 'truck' between frames or the
-    # confidence dips for one frame.
     if detector_mode == "auto" and selected_id is not None:
         for d in strong:
             if d.det_id == selected_id:
@@ -492,14 +513,13 @@ def resolve_selected_target() -> Detection | None:
             bcy = (best.bbox[1] + best.bbox[3]) / 2
             if math.hypot(bcx - ax, bcy - ay) <= MAX_ANCHOR_REASSOC_CROSS_CLASS_PX:
                 return best
-        return None
+        return _ghost_target()
 
     if selected_name is not None:
         named = [d for d in strong if d.name == selected_name]
     else:
         named = list(strong)
     if not named:
-        # Color: try class-agnostic spatial recovery
         if selected_anchor_xy and strong:
             ax, ay = selected_anchor_xy
             best = _nearest_to_anchor(strong, ax, ay)
@@ -507,7 +527,7 @@ def resolve_selected_target() -> Detection | None:
             bcy = (best.bbox[1] + best.bbox[3]) / 2
             if math.hypot(bcx - ax, bcy - ay) <= MAX_ANCHOR_REASSOC_CROSS_CLASS_PX:
                 return best
-        return None
+        return _ghost_target()
     if selected_anchor_xy is None:
         return named[0] if len(named) == 1 else None
     ax, ay = selected_anchor_xy
@@ -516,7 +536,7 @@ def resolve_selected_target() -> Detection | None:
     bcy = (best.bbox[1] + best.bbox[3]) / 2
     dist = math.hypot(bcx - ax, bcy - ay)
     if dist > MAX_ANCHOR_REASSOC_PX:
-        return None
+        return _ghost_target()
     return best
 
 
@@ -576,12 +596,19 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
         return
 
     last_target_ts = now
-    selected_id = target.det_id
+    # Only update the selected_id when we got a REAL detection (score>0), not
+    # a forward-filled ghost.
+    if target.score > 0:
+        selected_id = target.det_id
 
     x1, y1, x2, y2 = target.bbox
     cx_raw = (x1 + x2) / 2.0
     cy_raw = (y1 + y2) / 2.0
     selected_anchor_xy = (cx_raw, cy_raw)
+    if target.score > 0:
+        global last_target_w, last_target_h
+        last_target_w = float(x2 - x1)
+        last_target_h = float(y2 - y1)
 
     # Exponential filter on bbox center to remove detector micro-jitter
     global smoothed_cx, smoothed_cy, smoothed_init
@@ -661,11 +688,15 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     desired_tilt = actual_tilt + TILT_SIGN * tilt_u_deg
 
     # Rate limit + low-pass filter on outgoing command for smooth motion.
-    pan_max_step = pan_gains.max_rate_deg_s * dt
-    tilt_max_step = tilt_gains.max_rate_deg_s * dt
+    # At higher zoom the effective FOV shrinks. A normal max_rate would slew
+    # the camera past the visible window before the next detection arrives,
+    # so we scale the rate cap inversely with zoom.
+    zoom_scale = 1.0 / max(1.0, zoom_factor)
+    pan_max_step = pan_gains.max_rate_deg_s * dt * zoom_scale
+    tilt_max_step = tilt_gains.max_rate_deg_s * dt * zoom_scale
     pan_step_raw = clamp(desired_pan - pan_deg, -pan_max_step, pan_max_step)
     tilt_step_raw = clamp(desired_tilt - tilt_deg, -tilt_max_step, tilt_max_step)
-    lpf = 0.30
+    lpf = 0.32 / max(1.0, math.sqrt(zoom_factor))  # softer LPF when zoomed
 
     # Inside deadband: freeze command at actual joint position and decay
     # integral fast so we don't accumulate noise into the next motion.
@@ -828,7 +859,7 @@ _detection_busy_since = 0.0
 _detection_last_dispatch = 0.0
 _detection_last_completed = 0.0
 _detection_last_latency_s = 0.0
-DETECTION_INTERVAL_S = 1.0 / 8.0  # cap detection at 8 Hz to free CPU
+DETECTION_INTERVAL_S = 1.0 / 12.0  # 12 Hz — between flicker resilience and CPU
 DETECTION_BUSY_TIMEOUT_S = 3.0    # force-reset busy flag if worker hangs
 
 
@@ -1637,10 +1668,10 @@ def api_gains():
     data = request.get_json(force=True, silent=True) or {}
     with lock:
         if data.get("reset"):
-            pan_gains.kp = 0.55; pan_gains.ki = 0.15; pan_gains.kd = 0.12
-            pan_gains.max_rate_deg_s = 45.0; pan_gains.deadband_norm = 0.018
-            tilt_gains.kp = 0.55; tilt_gains.ki = 0.15; tilt_gains.kd = 0.12
-            tilt_gains.max_rate_deg_s = 32.0; tilt_gains.deadband_norm = 0.022
+            pan_gains.kp = 0.50; pan_gains.ki = 0.18; pan_gains.kd = 0.14
+            pan_gains.max_rate_deg_s = 35.0; pan_gains.deadband_norm = 0.008
+            tilt_gains.kp = 0.50; tilt_gains.ki = 0.18; tilt_gains.kd = 0.14
+            tilt_gains.max_rate_deg_s = 26.0; tilt_gains.deadband_norm = 0.012
             reset_controller_state()
             return jsonify({"ok": True, "reset": True})
         for key in ("kp", "ki", "kd"):
