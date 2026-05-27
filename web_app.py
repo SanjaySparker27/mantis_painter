@@ -149,6 +149,7 @@ smoothed_init = False
 last_target_w = 60.0
 last_target_h = 60.0
 PERSIST_HORIZON_S = 3.0  # forward-fill detection up to this long after a miss
+LONG_LOST_REACQUIRE_S = 120.0  # try same-name re-acquisition for this long
 pan_i_deg = 0.0
 tilt_i_deg = 0.0
 last_ex_norm = 0.0
@@ -598,7 +599,22 @@ def resolve_selected_target() -> Detection | None:
                 bcy = (best.bbox[1] + best.bbox[3]) / 2
                 if math.hypot(bcx - ax, bcy - ay) <= cross_gate:
                     return best
-        return _ghost_target()
+        g = _ghost_target()
+        if g is not None:
+            return g
+        # Persistent memory: ghost horizon expired but selection still alive.
+        # Look anywhere in the frame for a same-name detection whose bbox
+        # size is similar to the last-seen target — re-bind to it. This is
+        # the "the car drove out, came back, please follow it again" path.
+        if selected_name is not None and strong:
+            dt_lost = (time.time() - last_target_seen_ts) if last_target_seen_ts else 0.0
+            if dt_lost <= LONG_LOST_REACQUIRE_S:
+                same_name_any = [d for d in strong if d.name == selected_name
+                                 and _bbox_size_similar(d)]
+                if same_name_any:
+                    same_name_any.sort(key=lambda d: -d.score)
+                    return same_name_any[0]
+        return None
 
     if selected_name is not None:
         named = [d for d in strong if d.name == selected_name]
@@ -693,13 +709,15 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
         return
 
     last_target_ts = now
-    # Only update the selected_id when we got a REAL detection (score>0) AND
-    # ByteTrack still has the same ID. If we matched via spatial fallback the
-    # returned bbox may belong to a SIBLING (e.g. another car nearby) — keep
-    # the original selected_id so when ByteTrack reacquires we snap back to
-    # the real target, not to whichever sibling we picked.
-    if target.score > 0 and (selected_id is None or target.det_id == selected_id):
-        selected_id = target.det_id
+    if target.score > 0:
+        id_in_frame = any(d.det_id == selected_id for d in detections)
+        if selected_id is None or target.det_id == selected_id:
+            selected_id = target.det_id
+        elif not id_in_frame and target.name == selected_name:
+            # Persistent re-bind: our ByteTrack ID is gone from the frame
+            # entirely AND the resolver handed us a same-name candidate
+            # (the long-lost-reacquire path) — adopt its new ID.
+            selected_id = target.det_id
 
     x1, y1, x2, y2 = target.bbox
     cx_raw = (x1 + x2) / 2.0
