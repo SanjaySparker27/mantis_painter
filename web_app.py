@@ -691,7 +691,9 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     # At higher zoom the effective FOV shrinks. A normal max_rate would slew
     # the camera past the visible window before the next detection arrives,
     # so we scale the rate cap inversely with zoom.
-    zoom_scale = 1.0 / max(1.0, zoom_factor)
+    # Aggressive rate scaling: pixel-per-degree grows with zoom, so any
+    # over-correction looks proportionally larger. Scale max slew by 1/z^1.4.
+    zoom_scale = 1.0 / (max(1.0, zoom_factor) ** 1.4)
     pan_max_step = pan_gains.max_rate_deg_s * dt * zoom_scale
     tilt_max_step = tilt_gains.max_rate_deg_s * dt * zoom_scale
     pan_step_raw = clamp(desired_pan - pan_deg, -pan_max_step, pan_max_step)
@@ -1076,6 +1078,7 @@ HTML_PAGE = r"""
         <button id="bSweep" title="full autonomous loop: pick → center → paint → NEXT target. Remembers painted targets across sessions.">Auto Serial Tracker: OFF</button>
         <button id="bSweepReset" title="forget painted memory">Reset memory</button>
         <button id="bMoveTgt" title="move the orange ball back-and-forth so you can test dynamic tracking">Move target: OFF</button>
+        <button id="bKeyboard" title="enable keyboard control. Arrows/WASD = jog. Space = PAINT. T = toggle Tracking. C = Clear. H = Home. Esc = STOP.">Keyboard: OFF</button>
       </div>
 
       <div class="sect-head">Detector + Tracker</div>
@@ -1102,7 +1105,7 @@ HTML_PAGE = r"""
             <option value="10">10</option>
           </select>
         </label>
-        <span class="label">Keys: WASD or Arrows, Space=home, C=clear, M=manual, T=auto</span>
+        <span class="label">When Keyboard ON: Arrows/WASD=jog · Space=PAINT · T=Tracking · C=Clear · H=Home · Esc=STOP</span>
       </div>
 
       <div class="sect-head">Tracking tuning (slide to apply live)</div>
@@ -1273,17 +1276,26 @@ function jog(dir){
 }
 document.querySelectorAll('[data-jog]').forEach(b=>b.onclick=()=>jog(b.dataset.jog));
 
+let keyboardOn=false;
+bKeyboard.onclick=()=>{
+  keyboardOn=!keyboardOn;
+  bKeyboard.textContent='Keyboard: '+(keyboardOn?'ON':'OFF');
+  bKeyboard.classList.toggle('active',keyboardOn);
+};
 document.addEventListener('keydown',e=>{
-  if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return;
+  if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT'||e.target.tagName==='TEXTAREA') return;
+  if(!keyboardOn) return;
   const k=e.key.toLowerCase();
   if(k==='arrowleft'||k==='a'){jog('pan-left');e.preventDefault();}
   else if(k==='arrowright'||k==='d'){jog('pan-right');e.preventDefault();}
   else if(k==='arrowup'||k==='w'){jog('tilt-up');e.preventDefault();}
   else if(k==='arrowdown'||k==='s'){jog('tilt-down');e.preventDefault();}
-  else if(k===' '){setMode('home');e.preventDefault();}
+  else if(k===' '){bPaint.click();e.preventDefault();}
   else if(k==='c'){clear.click();}
   else if(k==='t'){bTrack.click();}
+  else if(k==='h'){setMode('home');}
   else if(k==='escape'||k==='x'){setMode('stop');e.preventDefault();}
+  else if(k==='p'){bPaint.click();}
 });
 
 function bindGain(id,key,vid){
@@ -1921,11 +1933,45 @@ def api_moving_target():
 
 @app.post("/api/zoom")
 def api_zoom():
-    global zoom_factor
+    global zoom_factor, selected_anchor_xy, smoothed_cx, smoothed_cy
+    global smoothed_init, target_vx_pix_s, target_vy_pix_s
+    global pan_i_deg, tilt_i_deg, last_ex_norm, last_ey_norm
     data = request.get_json(force=True, silent=True) or {}
-    z = safe_float(data, "zoom", zoom_factor, ZOOM_MIN, ZOOM_MAX)
+    new_z = safe_float(data, "zoom", zoom_factor, ZOOM_MIN, ZOOM_MAX)
     with lock:
-        zoom_factor = z
+        old_z = max(0.01, zoom_factor)
+        ratio = new_z / old_z
+        # Re-map every pixel-coord that the controller is holding so that
+        # the same WORLD ray maps to the new zoomed-frame pixel. Without
+        # this the anchor referred to the old crop and the controller would
+        # see a huge artificial error and slew the camera off the target.
+        cx_img = IMG_W / 2.0
+        cy_img = IMG_H / 2.0
+        if selected_anchor_xy is not None:
+            ax, ay = selected_anchor_xy
+            selected_anchor_xy = (cx_img + (ax - cx_img) * ratio,
+                                  cy_img + (ay - cy_img) * ratio)
+        if smoothed_init:
+            smoothed_cx = cx_img + (smoothed_cx - cx_img) * ratio
+            smoothed_cy = cy_img + (smoothed_cy - cy_img) * ratio
+        # pixel velocity scales with image-pixels-per-degree (same ratio).
+        target_vx_pix_s *= ratio
+        target_vy_pix_s *= ratio
+        global last_target_w, last_target_h
+        last_target_w *= ratio
+        last_target_h *= ratio
+        # Reset PID memory and sync cmd to actual — the new zoom abruptly
+        # changes pixel-error scale, so any cmd that was "ahead" of actual
+        # would now correspond to a wildly different desired angle.
+        pan_i_deg = 0.0
+        tilt_i_deg = 0.0
+        last_ex_norm = 0.0
+        last_ey_norm = 0.0
+        global pan_deg, tilt_deg
+        if joint_state_stamp:
+            pan_deg = actual_pan_deg
+            tilt_deg = actual_tilt_deg
+        zoom_factor = new_z
     return jsonify({"ok": True, "zoom": zoom_factor})
 
 
