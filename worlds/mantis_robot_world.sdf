@@ -54,6 +54,20 @@
       <direction>-0.45 0.2 -0.86</direction>
     </light>
 
+    <!-- Big grass plane so the world doesn't end after 90 m and the
+         encircling objects sit on something. -->
+    <model name="grass_ground">
+      <static>true</static>
+      <pose>0 0 -0.03 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>300 300 0.04</size></box></geometry></collision>
+        <visual name="v">
+          <geometry><box><size>300 300 0.04</size></box></geometry>
+          <material><ambient>0.18 0.32 0.14 1</ambient><diffuse>0.22 0.40 0.18 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
     <model name="road">
       <static>true</static>
       <link name="link">
@@ -184,6 +198,74 @@
         <topic>moving_target/cmd_vel</topic>
       </plugin>
     </model>
+
+    <!-- Encircling props: 12 objects on a 15 m ring around mantis (0,-8).
+         Positions are pre-computed as (15*sin(θ), -8 + 15*cos(θ)) so
+         θ=0° is north of mantis, θ=90° east, θ=180° south, θ=270° west.
+         Variety: 3 houses + cones + barrel + buses + mailbox + hydrant +
+         trash bin so the tracker sees mixed YOLO classes. -->
+    <!-- Ring radius is 30 m from mantis at (0,-8). Positions are
+         (30*sin(θ), -8 + 30*cos(θ)) for θ stepping 30° from north. -->
+    <include>
+      <name>ring_house_1</name>
+      <pose>0.00 22.00 0 0 0 3.14</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/House 1</uri>
+    </include>
+    <include>
+      <name>ring_cone_a</name>
+      <pose>15.00 18.00 0 0 0 0</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/Construction Cone</uri>
+    </include>
+    <include>
+      <name>ring_barrel_a</name>
+      <pose>25.98 7.00 0 0 0 0</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/Construction Barrel</uri>
+    </include>
+    <include>
+      <name>ring_bus_a</name>
+      <pose>30.00 -8.00 0 0 0 1.5708</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/Bus</uri>
+    </include>
+    <include>
+      <name>ring_house_2</name>
+      <pose>25.98 -23.00 0 0 0 0</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/House 2</uri>
+    </include>
+    <include>
+      <name>ring_mailbox_a</name>
+      <pose>15.00 -33.98 0 0 0 0</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/MailBox</uri>
+    </include>
+    <include>
+      <name>ring_house_3</name>
+      <pose>0.00 -38.00 0 0 0 0</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/House 3</uri>
+    </include>
+    <include>
+      <name>ring_hydrant_a</name>
+      <pose>-15.00 -33.98 0 0 0 0</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/Fire Hydrant</uri>
+    </include>
+    <include>
+      <name>ring_pine_a</name>
+      <pose>-25.98 -23.00 0 0 0 0</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/Pine Tree</uri>
+    </include>
+    <include>
+      <name>ring_cabinet_a</name>
+      <pose>-30.00 -8.00 0 0 0 0</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/Cabinet</uri>
+    </include>
+    <include>
+      <name>ring_cone_b</name>
+      <pose>-25.98 7.00 0 0 0 0</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/Construction Cone</uri>
+    </include>
+    <include>
+      <name>ring_person_a</name>
+      <pose>-15.00 18.00 0 0 0 0</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/Standing person</uri>
+    </include>
 
   </world>
 </sdf>

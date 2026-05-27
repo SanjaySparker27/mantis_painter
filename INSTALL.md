@@ -1,6 +1,32 @@
-# Install — clone + run on any Linux box
+# Install — clone + run
 
-Tested on Ubuntu 24.04 + Gazebo Harmonic. Adjust commands for your distro.
+Tested on Ubuntu 24.04 + Gazebo Harmonic. macOS works with **webcam mode**
+(no Gazebo). Adjust commands for your distro.
+
+## macOS quickstart (webcam-only — no Gazebo sim)
+
+```bash
+brew install python@3.12
+git clone https://github.com/SanjaySparker27/mantis_painter
+cd mantis_painter
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python3 web_app.py
+```
+
+Open http://127.0.0.1:5055, click **Connect** (top-left) → **Laptop
+Webcam #0**. macOS will pop a camera permission prompt — approve it.
+
+Skip `gz-harmonic`, the world SDF, and the Fuel model downloads on Mac.
+The tracker, detector, sweep painter, web UI all work the same on top
+of any webcam.
+
+For the **YOLO-World** detector, see §2a below for CLIP weights.
+
+---
+
+## Linux full install (with Gazebo sim)
 
 ## 1. System packages
 
@@ -22,6 +48,39 @@ https://gazebosim.org/docs/harmonic/install_ubuntu
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+`requirements.txt` pulls a `clip` package from git for the optional
+YOLO-World open-vocab detector. If your machine doesn't have git/network,
+strip the last line of `requirements.txt`; the closed-set YOLOv12 detector
+and HSV detector still work without CLIP.
+
+### 2a. YOLO-World CLIP weights (first time only)
+
+The `YOLO-World` button in the UI uses CLIP-ViT-B/32 text embeddings.
+Ultralytics tries to auto-download (~354 MB) on first use; if your network
+fails the SHA check, fetch manually:
+
+```bash
+mkdir -p ~/.cache/clip
+curl -fL -o ~/.cache/clip/ViT-B-32.pt \
+  https://openaipublic.azureedge.net/clip/models/40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af/ViT-B-32.pt
+```
+
+The web app monkey-patches CLIP's SHA check so a re-uploaded CDN copy still
+loads — no further action needed.
+
+### 2b. Webcam permission (macOS / Linux)
+
+To use the **Connect → Laptop Webcam** option:
+
+- **macOS**: first launch will prompt for camera permission. Approve in
+  System Settings → Privacy & Security → Camera.
+- **Linux**: add yourself to the `video` group:
+
+```bash
+sudo usermod -aG video $USER
+# log out + back in (or reboot) for the group change to apply
 ```
 
 ## 3. Optional — local LLM agent (Ollama)

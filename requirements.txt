@@ -6,3 +6,6 @@ torch>=2.2
 pyserial>=3.5
 matplotlib>=3.8
 requests>=2.31
+# Optional — only needed for the YOLO-World open-vocab detector (dWorld
+# button + /api/world_classes). Skip if you only use YOLOv12 or HSV.
+clip @ git+https://github.com/ultralytics/CLIP.git

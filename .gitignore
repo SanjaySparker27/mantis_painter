@@ -13,6 +13,12 @@ yolo12n.pt
 yolo11n.pt
 yolov8n.pt
 yolov5*.pt
+yolov8s-world.pt
+yolov8m-world.pt
+yolov8l-world.pt
+yolov8x-world.pt
+yoloe-*.pt
+mobileclip_blt.ts
 
 # Runtime artefacts
 output/

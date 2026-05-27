@@ -147,6 +147,24 @@ smoothed_cx = 0.0
 smoothed_cy = 0.0
 smoothed_init = False
 selected_signature: np.ndarray | None = None   # HSV histogram of the selected bbox
+_resolve_via_same_id: bool = False   # set True only when resolver returned via pre-flight same_id branch
+# Pass 1 tightening thresholds (Fix A)
+PASS1_SIG_MAX = 0.35       # Bhattacharyya cap (was 0.45)
+PASS1_SIG_GAP = 0.05       # top vs 2nd-best sig_d must differ by at least this; only enforced when 3+ candidates
+PASS1_IOU_MIN = 0.15       # candidate bbox must overlap KF-predicted bbox by this (skipped when pred_bbox unavailable)
+# New-ID confirmation hysteresis (Fix C)
+NEW_ID_CONFIRM_FRAMES = 3  # require this many consecutive resolver hits on a new det_id before rebinding selected_id
+_pending_new_id: int | None = None
+_pending_new_id_streak: int = 0
+# Long-lost re-acquire tightening (Fix D)
+LONGLOST_SIG_MAX = 0.30    # only re-bind via long-lost path if signature distance under this
+# Auto-zoom (auto-mode): keep the locked target's bbox area inside a band.
+auto_zoom_enabled: bool = False
+AUTO_ZOOM_LOW = 0.012      # bbox area / frame area below this -> zoom in
+AUTO_ZOOM_HIGH = 0.18      # bbox area / frame area above this -> zoom out
+AUTO_ZOOM_STEP = 0.2
+AUTO_ZOOM_COOLDOWN_S = 1.0
+_last_auto_zoom_ts: float = 0.0
 
 
 class TargetKF:
@@ -248,9 +266,27 @@ paint_overlay_marks: list[dict] = []
 PAINT_OVERLAY_TTL_S = 1.6
 
 sweep_enabled = False
+# Per-INSTANCE memory of which detection ids we've already painted in this
+# sweep cycle. Sweep cycles through distinct det_ids (not names), so two
+# cars on screen each get painted instead of "car class painted, skip".
+sweep_painted_ids: set[int] = set()
+# Backwards-compat alias surfaced via /api/status so the UI doesn't crash;
+# count is what matters there.
 sweep_painted_names: set[str] = set()
 sweep_last_advance_ts = 0.0
-SWEEP_PER_TARGET_TIMEOUT_S = 8.0
+center_hold_start_ts: float = 0.0
+sweep_center_hold_start_ts: float = 0.0
+SWEEP_PAINT_HOLD_S = 2.0      # require this much sustained centering before painting
+SWEEP_CENTER_TOL_NORM = 0.12  # 12 % of frame from center counts as centered for the sweep painter (deadband is far tighter for the controller itself)
+# Scanning: after painting, if no fresh target is in current FOV the sweep
+# pans the camera back-and-forth between pan limits until a new (un-painted)
+# detection appears. Stops the sweep from re-locking the same just-painted
+# object frame after frame.
+SWEEP_SCAN_RATE_DEG_S = 25.0
+SWEEP_SCAN_MAX_S = 12.0     # after this long with no new target, reset painted memory
+sweep_scan_dir: int = 1
+sweep_scan_start_ts: float = 0.0
+SWEEP_PER_TARGET_TIMEOUT_S = 5.0
 SWEEP_MEMORY_FILE = "/tmp/mantis_painted_memory.json"
 
 
@@ -287,6 +323,9 @@ YOLO_WEIGHTS_TRY = [
 _yolo_model = None
 _yolo_tracker_cfg = "bytetrack.yaml"
 _yolo_class_palette = {}
+_yoloworld_model = None
+_yoloworld_classes: list[str] = ["car", "person", "truck", "drone"]
+_yoloworld_classes_loaded: tuple[str, ...] = tuple()
 
 
 def _load_yolo():
@@ -317,6 +356,99 @@ def _load_yolo():
         except Exception as exc:
             yolo_status = f"load {w} failed: {exc}"
     return None
+
+
+def _patch_clip_sha_check():
+    """OpenAI CLIP hard-codes an Azure SHA in the URL path and rejects a
+    cached file whose SHA doesn't match. The CDN has re-uploaded the same
+    weights with a different SHA, so the bundled check always fails. We
+    short-circuit it: if the cached file already exists, trust it."""
+    try:
+        import clip.clip as _cc
+        orig = _cc._download
+        def _trusting_download(url, root):
+            import os
+            target = os.path.join(root, os.path.basename(url))
+            if os.path.exists(target) and os.path.getsize(target) > 1024 * 1024:
+                return target
+            return orig(url, root)
+        _cc._download = _trusting_download
+    except Exception:
+        pass
+
+
+def _load_yoloworld():
+    """Lazy-load YOLO-World. Open-vocab detector keyed on free-text classes
+    set via _yoloworld_classes. Same Ultralytics tracker API as v12."""
+    global _yoloworld_model, yolo_status
+    if _yoloworld_model is not None:
+        return _yoloworld_model
+    _patch_clip_sha_check()
+    try:
+        from ultralytics import YOLOWorld  # type: ignore
+    except Exception as exc:
+        yolo_status = f"YOLOWorld import failed: {exc}"
+        return None
+    for w in ("yolov8s-world.pt", "yolov8m-world.pt"):
+        try:
+            m = YOLOWorld(w)
+            _ = m.predict
+            _yoloworld_model = m
+            yolo_status = f"loaded {w}"
+            return m
+        except Exception as exc:
+            yolo_status = f"load {w} failed: {exc}"
+    return None
+
+
+def detect_with_yoloworld(frame: np.ndarray) -> list[Detection] | None:
+    global _yoloworld_classes_loaded
+    model = _load_yoloworld()
+    if model is None:
+        return None
+    want = tuple(_yoloworld_classes)
+    if want != _yoloworld_classes_loaded and want:
+        try:
+            model.set_classes(list(want))
+            _yoloworld_classes_loaded = want
+        except Exception as exc:
+            globals()["yolo_status"] = f"set_classes failed: {exc}"
+    try:
+        results = model.track(
+            source=frame,
+            persist=True,
+            tracker=_yolo_tracker_cfg,
+            conf=0.08,
+            iou=0.4,
+            verbose=False,
+        )
+    except Exception as exc:
+        globals()["yolo_status"] = f"world track exception: {exc}"
+        return None
+    out: list[Detection] = []
+    if not results:
+        return out
+    res = results[0]
+    boxes = getattr(res, "boxes", None)
+    if boxes is None:
+        return out
+    # Map class index to the prompt the user typed. Ultralytics keeps
+    # numeric labels in res.names after set_classes, so we look up our own
+    # list instead.
+    classes = list(_yoloworld_classes_loaded) or list(_yoloworld_classes)
+    for i in range(len(boxes)):
+        b = boxes[i]
+        xyxy = b.xyxy[0].tolist()
+        cls = int(b.cls[0]) if b.cls is not None else -1
+        score = float(b.conf[0]) if b.conf is not None else 0.0
+        det_id = int(b.id[0]) if (b.id is not None and len(b.id) > 0) else -1
+        name = classes[cls] if 0 <= cls < len(classes) else str(cls)
+        out.append(Detection(
+            det_id=det_id, name=name,
+            bbox=(int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])),
+            score=score, color=_color_for_class(cls),
+        ))
+    return out
 
 
 def _color_for_class(cid: int) -> tuple[int, int, int]:
@@ -514,6 +646,9 @@ def clear_selection() -> None:
     global selected_signature, selected_kf
     global target_world_pan_deg, target_world_tilt_deg
     global target_pan_rate_deg_s, target_tilt_rate_deg_s, last_bearing_ts
+    global _pending_new_id, _pending_new_id_streak
+    _pending_new_id = None
+    _pending_new_id_streak = 0
     target_world_pan_deg = None
     target_world_tilt_deg = None
     target_pan_rate_deg_s = 0.0
@@ -615,6 +750,57 @@ def _candidate_score(d, ax, ay, ref_sig):
     return dist + 800.0 * sig_dist + 200.0 * (1.0 - size_ratio)
 
 
+def _confirm_new_id(cand: "Detection") -> "Detection | None":
+    """Hysteresis on selected_id rebind. When the resolver wants to bind onto
+    a det_id different from selected_id, require NEW_ID_CONFIRM_FRAMES
+    consecutive hits on that same new det_id first. Until confirmed, hand
+    back the ghost so the controller holds the last-known position instead
+    of jumping. Returns cand on confirm/same-id, ghost (or cand fallback if
+    ghost expired) while pending."""
+    global _pending_new_id, _pending_new_id_streak
+    if selected_id is None or cand.det_id == selected_id:
+        _pending_new_id = None
+        _pending_new_id_streak = 0
+        return cand
+    # During Auto Serial Tracker centering, the camera is trying to hold
+    # the bbox in the deadband for 2 s. Any rebind to a sibling here causes
+    # the visible [LOCKED] box to shift mid-paint. Lock down hard: return
+    # ghost until centering completes or the watchdog kills it.
+    if sweep_enabled and sweep_center_hold_start_ts > 0:
+        g = _ghost_target()
+        return g if g is not None else cand
+    # Count any frame where the resolver wants to rebind, even if YOLO is
+    # thrashing the det_id between frames. Without this, hysteresis never
+    # confirms when ByteTrack assigns a new id each frame (e.g. after a
+    # zoom change) — the camera would drift home while we keep waiting.
+    _pending_new_id_streak += 1
+    _pending_new_id = cand.det_id
+    # Loosen the confirmation count right after a zoom change: ByteTrack
+    # drops the ID, every candidate is a "new" one, and a 3-frame wait
+    # leaves the camera homing while we hesitate.
+    threshold = NEW_ID_CONFIRM_FRAMES
+    if zoom_changed_ts > 0 and (time.time() - zoom_changed_ts) < ZOOM_GRACE_S:
+        threshold = max(1, NEW_ID_CONFIRM_FRAMES - 2)
+    if _pending_new_id_streak >= threshold:
+        _pending_new_id = None
+        _pending_new_id_streak = 0
+        return cand
+    g = _ghost_target()
+    return g if g is not None else cand
+
+
+def _bbox_iou(b1, b2) -> float:
+    """IoU of two (x1,y1,x2,y2) bboxes. 0 when disjoint or invalid."""
+    x1 = max(b1[0], b2[0]); y1 = max(b1[1], b2[1])
+    x2 = min(b1[2], b2[2]); y2 = min(b1[3], b2[3])
+    iw = max(0.0, x2 - x1); ih = max(0.0, y2 - y1)
+    inter = iw * ih
+    a1 = max(0.0, (b1[2] - b1[0]) * (b1[3] - b1[1]))
+    a2 = max(0.0, (b2[2] - b2[0]) * (b2[3] - b2[1]))
+    union = a1 + a2 - inter
+    return inter / union if union > 0 else 0.0
+
+
 def _bbox_size_similar(d) -> bool:
     """True if candidate bbox is within BBOX_SIZE_RATIO_TOL of last seen
     bbox size. Stops a small/large nearby detection from being accepted
@@ -651,6 +837,8 @@ def _ghost_target() -> Detection | None:
 
 
 def resolve_selected_target() -> Detection | None:
+    global _resolve_via_same_id, _pending_new_id, _pending_new_id_streak
+    _resolve_via_same_id = False
     if selected_name is None and selected_id is None:
         return None
     pool = detections
@@ -670,7 +858,7 @@ def resolve_selected_target() -> Detection | None:
     # is wildly inconsistent with the Kalman track AND the appearance has
     # changed — that pattern is YOLO putting our ID on a different physical
     # object (rare but happens).
-    if detector_mode == "auto" and selected_id is not None:
+    if detector_mode in ("auto", "world") and selected_id is not None:
         same_id = next((d for d in strong if d.det_id == selected_id), None)
         if same_id is not None:
             if selected_kf is not None:
@@ -682,8 +870,12 @@ def resolve_selected_target() -> Detection | None:
                     # candidate search.
                     pass
                 else:
+                    _resolve_via_same_id = True
+                    _pending_new_id = None
+                    _pending_new_id_streak = 0
                     return same_id
             else:
+                _resolve_via_same_id = True
                 return same_id
 
     # During the ZOOM_GRACE window right after a zoom change, ByteTrack is
@@ -694,7 +886,7 @@ def resolve_selected_target() -> Detection | None:
     name_gate = (MAX_ANCHOR_REASSOC_PX * 2.5) if in_zoom_grace else MAX_ANCHOR_REASSOC_PX
     cross_gate = (MAX_ANCHOR_REASSOC_CROSS_CLASS_PX * 2.0) if in_zoom_grace else MAX_ANCHOR_REASSOC_CROSS_CLASS_PX
 
-    if detector_mode == "auto" and selected_id is not None:
+    if detector_mode in ("auto", "world") and selected_id is not None:
         if selected_kf is not None:
             ax, ay = selected_kf.position()
         elif selected_anchor_xy:
@@ -706,24 +898,53 @@ def resolve_selected_target() -> Detection | None:
             # Pass 1: candidates with similar HSV signature, regardless of
             # YOLO class label. Distant cars often get mis-classified as
             # 'truck' or 'airplane' so we can't rely on class alone.
-            sig_ranked = sorted(
-                strong,
-                key=lambda d: _signature_distance(
+            # Cache sig_d per candidate so we can rank + gap-test.
+            sig_pairs = []
+            for d in strong:
+                sd = _signature_distance(
                     selected_signature,
-                    _hsv_signature_from_bbox(latest_raw, d.bbox)),
-            )
-            for cand in sig_ranked[:3]:
+                    _hsv_signature_from_bbox(latest_raw, d.bbox))
+                sig_pairs.append((sd, d))
+            sig_pairs.sort(key=lambda p: p[0])
+            # Clear-winner gate: when 3+ candidates compete, top must beat
+            # 2nd by PASS1_SIG_GAP so near-identical siblings don't get
+            # bound interchangeably. With <=2 candidates we skip the gap
+            # check (no sibling ambiguity to resolve).
+            gap_ok = (len(sig_pairs) < 3) or (sig_pairs[1][0] - sig_pairs[0][0] >= PASS1_SIG_GAP)
+            # Predicted bbox at ax,ay scaled to last-seen target size, used
+            # for IoU gate so a candidate far from the predicted footprint
+            # is rejected even if its histogram matches.
+            pred_bbox = None
+            if last_target_w > 0 and last_target_h > 0:
+                pred_bbox = (ax - last_target_w / 2.0, ay - last_target_h / 2.0,
+                             ax + last_target_w / 2.0, ay + last_target_h / 2.0)
+            for sig_d, cand in sig_pairs[:3]:
                 cx = (cand.bbox[0] + cand.bbox[2]) / 2
                 cy = (cand.bbox[1] + cand.bbox[3]) / 2
-                sig_d = _signature_distance(
-                    selected_signature,
-                    _hsv_signature_from_bbox(latest_raw, cand.bbox))
                 m = (selected_kf.mahalanobis(cx, cy)
                      if selected_kf is not None else 0.0)
-                # Accept if signature is close AND Kalman gate passes.
-                if sig_d < 0.45 and m <= KF_MAHA_GATE:
-                    return cand
-            # Pass 2: same name + within spatial gate
+                iou_ok = True
+                if pred_bbox is not None:
+                    iou_ok = _bbox_iou(pred_bbox, cand.bbox) >= PASS1_IOU_MIN
+                # Accept only if signature is tight, Kalman gate passes,
+                # candidate is a clear winner, and overlaps the predicted
+                # footprint.
+                if (sig_d < PASS1_SIG_MAX and m <= KF_MAHA_GATE
+                        and gap_ok and iou_ok):
+                    # Pass 1 winner passed every gate, treat as high-
+                    # confidence so the signature can blend toward this
+                    # bbox next frame.
+                    _resolve_via_same_id = True
+                    return _confirm_new_id(cand)
+            # Adaptive gate: shrink the spatial radius for small targets so
+            # a sibling 60 px away can't be picked when the locked car is
+            # only 40 px wide on screen.
+            size_gate_limit = max(40.0, last_target_w * 1.5) if last_target_w > 0 else None
+            effective_name_gate = (min(name_gate, size_gate_limit)
+                                   if size_gate_limit is not None else name_gate)
+            effective_cross_gate = (min(cross_gate, size_gate_limit)
+                                    if size_gate_limit is not None else cross_gate)
+            # Pass 2: same name + within spatial gate + signature gate.
             if selected_name is not None:
                 same_name = [d for d in strong if d.name == selected_name]
                 if same_name:
@@ -733,16 +954,24 @@ def resolve_selected_target() -> Detection | None:
                     best = same_name[0]
                     bcx = (best.bbox[0] + best.bbox[2]) / 2
                     bcy = (best.bbox[1] + best.bbox[3]) / 2
-                    if math.hypot(bcx - ax, bcy - ay) <= name_gate:
-                        return best
-            # Pass 3: any class within tight spatial gate
+                    bsig = _signature_distance(
+                        selected_signature,
+                        _hsv_signature_from_bbox(latest_raw, best.bbox))
+                    if (math.hypot(bcx - ax, bcy - ay) <= effective_name_gate
+                            and bsig < 0.55):
+                        return _confirm_new_id(best)
+            # Pass 3: any class within tight spatial gate + sig gate.
             cross = strong if in_zoom_grace else [d for d in strong if _bbox_size_similar(d)]
             if cross:
                 best = _nearest_to_anchor(cross, ax, ay)
                 bcx = (best.bbox[0] + best.bbox[2]) / 2
                 bcy = (best.bbox[1] + best.bbox[3]) / 2
-                if math.hypot(bcx - ax, bcy - ay) <= cross_gate:
-                    return best
+                bsig = _signature_distance(
+                    selected_signature,
+                    _hsv_signature_from_bbox(latest_raw, best.bbox))
+                if (math.hypot(bcx - ax, bcy - ay) <= effective_cross_gate
+                        and bsig < 0.60):
+                    return _confirm_new_id(best)
         g = _ghost_target()
         if g is not None:
             return g
@@ -753,18 +982,21 @@ def resolve_selected_target() -> Detection | None:
         if selected_name is not None and strong:
             dt_lost = (time.time() - last_target_seen_ts) if last_target_seen_ts else 0.0
             if dt_lost <= LONG_LOST_REACQUIRE_S:
-                same_name_any = [d for d in strong if d.name == selected_name]
+                # Same name AND similar bbox size — rejects a near sibling
+                # whose footprint is much smaller/larger than the locked
+                # target.
+                same_name_any = [d for d in strong
+                                 if d.name == selected_name and _bbox_size_similar(d)]
                 if same_name_any and selected_signature is not None:
-                    # Pick the same-name candidate with the closest HSV
-                    # signature to the locked target. Distance is irrelevant
-                    # in long-lost: target may be anywhere in the frame.
                     same_name_any.sort(key=lambda d: _signature_distance(
                         selected_signature,
                         _hsv_signature_from_bbox(latest_raw, d.bbox)))
-                    return same_name_any[0]
-                if same_name_any:
-                    same_name_any.sort(key=lambda d: -d.score)
-                    return same_name_any[0]
+                    best = same_name_any[0]
+                    best_sig = _signature_distance(
+                        selected_signature,
+                        _hsv_signature_from_bbox(latest_raw, best.bbox))
+                    if best_sig < LONGLOST_SIG_MAX:
+                        return _confirm_new_id(best)
         return None
 
     if selected_name is not None:
@@ -809,6 +1041,7 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     global pan_deg, tilt_deg, pan_i_deg, tilt_i_deg, last_ex_norm, last_ey_norm
     global centered_frames, selected_id, selected_name, last_target_ts
     global selected_anchor_xy, sweep_last_advance_ts
+    global center_hold_start_ts, sweep_center_hold_start_ts
     global last_target_cx, last_target_cy, last_target_seen_ts
     global target_vx_pix_s, target_vy_pix_s
     global target_world_pan_deg, target_world_tilt_deg
@@ -816,6 +1049,39 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
 
     now = time.time()
     target = resolve_selected_target()
+
+    # Sweep watchdog: enforce SWEEP_PER_TARGET_TIMEOUT_S regardless of
+    # whether the resolver currently sees the target. Without this, a lost
+    # detection traps the sweep in pursuit/ghost mode forever because the
+    # sweep state machine below only runs when target is not None.
+    if (sweep_enabled and selected_id is not None
+            and sweep_last_advance_ts > 0
+            and now - sweep_last_advance_ts > SWEEP_PER_TARGET_TIMEOUT_S):
+        if selected_id not in sweep_painted_ids:
+            sweep_painted_ids.add(selected_id)
+        sweep_center_hold_start_ts = 0.0
+        clear_selection()
+        return
+
+    # Auto-zoom: shrink/expand the digital zoom so the locked target's bbox
+    # stays inside a usable size band. Only react to real detections (not
+    # ghosts) and respect a cooldown so we don't oscillate.
+    global _last_auto_zoom_ts
+    if (auto_zoom_enabled and target is not None and target.score > 0
+            and selected_id is not None
+            and (now - _last_auto_zoom_ts) > AUTO_ZOOM_COOLDOWN_S
+            and (now - zoom_changed_ts) > AUTO_ZOOM_COOLDOWN_S):
+        tw = float(target.bbox[2] - target.bbox[0])
+        th = float(target.bbox[3] - target.bbox[1])
+        area_frac = (tw * th) / float(IMG_W * IMG_H)
+        new_z = None
+        if area_frac < AUTO_ZOOM_LOW and zoom_factor < ZOOM_MAX - 0.05:
+            new_z = min(ZOOM_MAX, round((zoom_factor + AUTO_ZOOM_STEP) * 10) / 10)
+        elif area_frac > AUTO_ZOOM_HIGH and zoom_factor > ZOOM_MIN + 0.05:
+            new_z = max(ZOOM_MIN, round((zoom_factor - AUTO_ZOOM_STEP) * 10) / 10)
+        if new_z is not None and abs(new_z - zoom_factor) > 0.05:
+            _apply_zoom_locked(new_z)
+            _last_auto_zoom_ts = now
 
     if target is None:
         pan_i_deg *= 0.85
@@ -857,23 +1123,44 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
             centered_frames = 0
             return
         if selected_name is None and selected_id is None:
-            # Sweep mode: when idle, pick the first not-yet-painted detection.
+            # Sweep mode: when idle, pick the first not-yet-painted detection
+            # (per det_id — two cars in frame get painted separately).
             if sweep_enabled:
+                global sweep_scan_dir, sweep_scan_start_ts
                 candidate = next(
                     (d for d in detections
                      if d.score >= MIN_TRACK_SCORE
-                     and d.name not in sweep_painted_names),
+                     and d.det_id not in sweep_painted_ids),
                     None,
                 )
-                if candidate is None and sweep_painted_names:
-                    sweep_painted_names.clear()  # restart cycle
                 if candidate is not None:
+                    sweep_scan_start_ts = 0.0  # cancel any active scan
                     x1, y1, x2, y2 = candidate.bbox
                     selected_id = candidate.det_id
                     selected_name = candidate.name
                     selected_anchor_xy = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
                     sweep_last_advance_ts = now
                     return
+                # No fresh target in current FOV. Pan the camera to look for
+                # one — bouncing between pan limits — instead of resetting
+                # painted memory and re-locking the same just-painted target.
+                if sweep_scan_start_ts == 0.0:
+                    sweep_scan_start_ts = now
+                if now - sweep_scan_start_ts > SWEEP_SCAN_MAX_S:
+                    sweep_painted_ids.clear()
+                    sweep_scan_start_ts = 0.0
+                    return
+                pan_step = SWEEP_SCAN_RATE_DEG_S * dt * sweep_scan_dir
+                new_pan = pan_deg + pan_step
+                if new_pan >= PAN_LIMIT[1] - 1.0:
+                    new_pan = PAN_LIMIT[1] - 1.0
+                    sweep_scan_dir = -1
+                elif new_pan <= PAN_LIMIT[0] + 1.0:
+                    new_pan = PAN_LIMIT[0] + 1.0
+                    sweep_scan_dir = 1
+                pan_deg = new_pan
+                publish_pan_tilt()
+                return
             pan_deg = step_toward(HOME_PAN_DEG, pan_deg, HOME_MAX_RATE_DEG_S * dt)
             tilt_deg = step_toward(HOME_TILT_DEG, tilt_deg, HOME_MAX_RATE_DEG_S * dt)
         else:
@@ -901,13 +1188,17 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
             selected_kf.update(cx_meas, cy_meas)
         # Slowly refresh the HSV signature so it tracks gradual
         # appearance change (shadow, viewing angle) without snapping to
-        # a sibling on a single bad frame.
+        # a sibling on a single bad frame. Only blend on high-confidence
+        # frames (resolver returned via the same-id pre-flight branch);
+        # blending during Pass-1/ghost/long-lost lets the signature drift
+        # toward whatever the resolver guessed and prevents the real
+        # target from re-binding.
         global selected_signature
         new_sig = _hsv_signature_from_bbox(latest_raw, target.bbox)
         if new_sig is not None:
             if selected_signature is None:
                 selected_signature = new_sig
-            else:
+            elif _resolve_via_same_id:
                 selected_signature = 0.85 * selected_signature + 0.15 * new_sig
 
     x1, y1, x2, y2 = target.bbox
@@ -916,8 +1207,18 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     selected_anchor_xy = (cx_raw, cy_raw)
     if target.score > 0:
         global last_target_w, last_target_h
-        last_target_w = float(x2 - x1)
-        last_target_h = float(y2 - y1)
+        new_w = float(x2 - x1)
+        new_h = float(y2 - y1)
+        # Slew-limit size updates so one wrong-class bbox can't bloat the
+        # remembered footprint and unlock the size-similarity gate next
+        # frame. High-confidence binds (same-id pre-flight) take the full
+        # measurement; uncertain binds blend in slowly.
+        if _resolve_via_same_id or last_target_w <= 0 or last_target_h <= 0:
+            last_target_w = new_w
+            last_target_h = new_h
+        else:
+            last_target_w = 0.85 * last_target_w + 0.15 * new_w
+            last_target_h = 0.85 * last_target_h + 0.15 * new_h
 
     # Exponential filter on bbox center to remove detector micro-jitter
     global smoothed_cx, smoothed_cy, smoothed_init
@@ -1067,26 +1368,52 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
 
     if abs(nx) < pan_gains.deadband_norm and abs(ny) < tilt_gains.deadband_norm:
         centered_frames += 1
+        if center_hold_start_ts == 0.0:
+            center_hold_start_ts = now
     else:
         centered_frames = 0
+        center_hold_start_ts = 0.0
+    # Sweep painter uses a far looser centering tolerance — bbox jitter at
+    # 30 m makes the tight controller deadband never trigger.
+    if abs(nx) < SWEEP_CENTER_TOL_NORM and abs(ny) < SWEEP_CENTER_TOL_NORM:
+        if sweep_center_hold_start_ts == 0.0:
+            sweep_center_hold_start_ts = now
+    else:
+        sweep_center_hold_start_ts = 0.0
     if (paint_auto and centered_frames == paint_auto_min_centered
             and time.time() - paint_last_ts > 0.4):
         trigger_paint("auto-center-hold")
 
     if sweep_enabled:
-        # Auto-serial state machine: paint the locked target then advance.
-        if (centered_frames >= paint_auto_min_centered
-                and time.time() - paint_last_ts > 0.3
-                and target.name not in sweep_painted_names):
-            trigger_paint(f"sweep:{target.name}")
-            sweep_painted_names.add(target.name)
-            _save_painted_memory()
+        # Auto-serial state machine: hold center for SWEEP_PAINT_HOLD_S,
+        # paint THIS instance, mark its det_id painted, advance to next.
+        # If the target was manually clicked (not picked by sweep itself)
+        # sweep_last_advance_ts is 0 — initialize so the timeout below can
+        # still fire and keep us moving forward.
+        if sweep_last_advance_ts == 0.0:
+            sweep_last_advance_ts = now
+        held_s = ((now - sweep_center_hold_start_ts)
+                  if sweep_center_hold_start_ts else 0.0)
+        already_painted = selected_id is not None and selected_id in sweep_painted_ids
+        if (held_s >= SWEEP_PAINT_HOLD_S
+                and now - paint_last_ts > 0.3
+                and selected_id is not None
+                and not already_painted):
+            trigger_paint(f"sweep:{target.name}#{selected_id}")
+            sweep_painted_ids.add(selected_id)
+            sweep_center_hold_start_ts = 0.0
             clear_selection()
             return
-        if (sweep_last_advance_ts
-                and now - sweep_last_advance_ts > SWEEP_PER_TARGET_TIMEOUT_S):
-            sweep_painted_names.add(target.name)
-            _save_painted_memory()
+        # If the resolver re-bound onto an id we've already painted (common
+        # after a YOLO id flip), skip immediately rather than waiting on the
+        # timeout — otherwise we'd burn 5 s of "centering" on a done target.
+        if already_painted:
+            clear_selection()
+            return
+        if now - sweep_last_advance_ts > SWEEP_PER_TARGET_TIMEOUT_S:
+            # Couldn't center in time. Mark this instance done so we move on.
+            if selected_id is not None:
+                sweep_painted_ids.add(selected_id)
             clear_selection()
             return
 
@@ -1222,6 +1549,11 @@ DETECTION_BUSY_TIMEOUT_S = 3.0    # force-reset busy flag if worker hangs
 def run_detector(frame: np.ndarray) -> list[Detection]:
     if detector_mode == "color":
         return detect_colored_targets(frame)
+    if detector_mode == "world":
+        wd = detect_with_yoloworld(frame)
+        if wd is not None:
+            return wd
+        # fall through to closed-set YOLO if world load fails
     yolo_dets = detect_with_yolo(frame)
     if yolo_dets is None:
         return detect_colored_targets(frame)
@@ -1250,14 +1582,12 @@ def detection_worker(frame: np.ndarray) -> None:
         _detection_thread_busy = False
 
 
-def on_image(msg: Image) -> None:
+def _process_raw_frame(raw: np.ndarray) -> None:
+    """Shared pipeline: zoom → publish to UI → detector → controller. Used
+    by both the gz subscriber callback and any custom capture thread
+    (webcam, RTSP, ...)."""
     global latest_raw, latest_annotated, latest_stamp, frame_count
     global _detection_thread_busy, _eff_hfov, _eff_vfov
-    raw = image_to_bgr(msg)
-    if raw is None:
-        return
-    # Apply digital zoom BEFORE detection + drawing. Detector and controller
-    # therefore both see the zoomed-in view; effective FOV scales with zoom.
     frame, eff_h, eff_v = apply_digital_zoom(raw)
     with lock:
         latest_raw = frame
@@ -1283,6 +1613,75 @@ def on_image(msg: Image) -> None:
         _detection_last_dispatch = now
         threading.Thread(target=detection_worker, args=(frame,),
                          daemon=True).start()
+
+
+def on_image(msg: Image) -> None:
+    """gz transport callback. Decodes the gz Image and feeds the shared
+    pipeline."""
+    raw = image_to_bgr(msg)
+    if raw is None:
+        return
+    _process_raw_frame(raw)
+
+
+# --- Pluggable frame sources -------------------------------------------------
+# UI's Connect dropdown switches between gz (Gazebo sim) and webcam capture.
+# All sources hand a BGR ndarray to _process_raw_frame; the rest of the
+# pipeline is unchanged.
+frame_source = "gz"                  # "gz" | "webcam:<idx>"
+_webcam_thread: threading.Thread | None = None
+_webcam_stop = threading.Event()
+_webcam_cap = None
+_webcam_last_error = ""
+
+
+def _webcam_loop(index: int) -> None:
+    global _webcam_cap, _webcam_last_error
+    try:
+        _webcam_cap = cv2.VideoCapture(index)
+        # ask for 1280x720 — if camera can't, opencv falls back gracefully
+        _webcam_cap.set(cv2.CAP_PROP_FRAME_WIDTH, IMG_W)
+        _webcam_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMG_H)
+        _webcam_cap.set(cv2.CAP_PROP_FPS, 30)
+        if not _webcam_cap.isOpened():
+            _webcam_last_error = f"could not open webcam index {index}"
+            return
+    except Exception as exc:
+        _webcam_last_error = f"webcam open exception: {exc}"
+        return
+    _webcam_last_error = ""
+    while not _webcam_stop.is_set():
+        ok, frame = _webcam_cap.read()
+        if not ok or frame is None:
+            time.sleep(0.05)
+            continue
+        # Resize to canonical frame size so the rest of the pipeline (anchor
+        # gates, deadbands) works without retuning.
+        if frame.shape[1] != IMG_W or frame.shape[0] != IMG_H:
+            frame = cv2.resize(frame, (IMG_W, IMG_H))
+        _process_raw_frame(frame)
+    try:
+        _webcam_cap.release()
+    except Exception:
+        pass
+    _webcam_cap = None
+
+
+def _stop_webcam() -> None:
+    global _webcam_thread
+    _webcam_stop.set()
+    if _webcam_thread is not None and _webcam_thread.is_alive():
+        _webcam_thread.join(timeout=2.0)
+    _webcam_thread = None
+    _webcam_stop.clear()
+
+
+def _start_webcam(index: int) -> None:
+    global _webcam_thread
+    _stop_webcam()
+    _webcam_thread = threading.Thread(target=_webcam_loop, args=(index,),
+                                      daemon=True)
+    _webcam_thread.start()
 
 
 def on_joint_state(msg: Model) -> None:
@@ -1408,6 +1807,9 @@ HTML_PAGE = r"""
     .title{height:38px;display:flex;align-items:center;justify-content:space-between;padding:0 12px;border-bottom:1px solid var(--line);color:var(--muted);font-size:13px}
     #feedWrap{position:relative;overflow:hidden;background:#050607;aspect-ratio:16/9;cursor:crosshair}
     #feed{width:100%;aspect-ratio:16/9;display:block;background:#050607;cursor:crosshair}
+    .shortcuts{position:absolute;top:8px;right:8px;background:rgba(8,11,14,.72);border:1px solid #2b3138;border-radius:6px;padding:6px 9px;font-size:11px;line-height:1.45;color:#cfd6dc;pointer-events:none;font-family:ui-monospace,Menlo,Consolas,monospace;backdrop-filter:blur(2px)}
+    .shortcuts b{color:var(--cyan);font-weight:600}
+    .shortcuts .hd{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:3px}
     .stats{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;padding:10px}
     .stat{border:1px solid var(--line);border-radius:6px;padding:10px;min-height:62px}
     .label{color:var(--muted);font-size:12px}
@@ -1430,7 +1832,39 @@ HTML_PAGE = r"""
 </head>
 <body>
 <header>
-  <h1>MANTIS PAINTER &mdash; Nose Camera Tracking</h1>
+  <div style="display:flex;align-items:center;gap:12px">
+    <h1>MANTIS PAINTER &mdash; Nose Camera Tracking</h1>
+    <div style="position:relative">
+      <button id="bConnect" title="Connection settings: choose video source + configure paint signal output (gz/file/UDP/TCP/serial).">Connect: Gazebo Sim</button>
+      <div id="connectMenu" style="display:none;position:absolute;top:38px;left:0;background:#181b1f;border:1px solid var(--line);border-radius:8px;padding:10px;z-index:1000;width:420px;box-shadow:0 8px 24px rgba(0,0,0,.4)">
+        <div class="sect-head" style="padding:0 0 6px">Frame source</div>
+        <button class="connOpt" data-src="auto" style="display:block;width:100%;text-align:left;height:30px;margin-bottom:6px;background:#1f4d8c;border-color:#3a78c0;color:#fff" title="Probe Gazebo (camera topic + joint state) and webcams 0/1/2, lock onto the first one that responds.">⚡ Auto Detect &amp; Connect</button>
+        <button class="connOpt" data-src="gz" style="display:block;width:100%;text-align:left;height:30px;margin-bottom:4px">Gazebo Sim (/mantis/nose_camera/image)</button>
+        <button class="connOpt" data-src="webcam:0" style="display:block;width:100%;text-align:left;height:30px;margin-bottom:4px">Laptop Webcam #0</button>
+        <button class="connOpt" data-src="webcam:1" style="display:block;width:100%;text-align:left;height:30px;margin-bottom:4px">USB Webcam #1</button>
+        <button class="connOpt" data-src="webcam:2" style="display:block;width:100%;text-align:left;height:30px;margin-bottom:8px">USB Webcam #2</button>
+        <div class="sect-head" style="padding:6px 0">Paint signal channels</div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;padding-bottom:6px">
+          <label class="label"><input type="checkbox" id="chGz" checked> gz topic</label>
+          <label class="label"><input type="checkbox" id="chFile" checked> file</label>
+          <label class="label"><input type="checkbox" id="chUdp"> UDP</label>
+          <label class="label"><input type="checkbox" id="chTcp"> TCP</label>
+          <label class="label"><input type="checkbox" id="chSerial"> serial</label>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;padding-bottom:4px">
+          <label class="label">UDP host <input id="udpHost" value="127.0.0.1" style="width:100%;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 6px;margin-top:2px"></label>
+          <label class="label">UDP port <input id="udpPort" value="9000" style="width:100%;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 6px;margin-top:2px"></label>
+          <label class="label">TCP host <input id="tcpHost" value="127.0.0.1" style="width:100%;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 6px;margin-top:2px"></label>
+          <label class="label">TCP port <input id="tcpPort" value="9001" style="width:100%;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 6px;margin-top:2px"></label>
+          <label class="label">Serial port <input id="serPort" value="/dev/ttyUSB0" style="width:100%;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 6px;margin-top:2px"></label>
+          <label class="label">Baud <input id="serBaud" value="9600" style="width:100%;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 6px;margin-top:2px"></label>
+        </div>
+        <div style="display:flex;justify-content:flex-end;gap:6px;padding-top:6px">
+          <button id="chSave">Apply channels</button>
+        </div>
+      </div>
+    </div>
+  </div>
   <div class="label">Click target. Pan/tilt centers it. Manual mode + jog enabled.</div>
 </header>
 <main>
@@ -1444,7 +1878,29 @@ HTML_PAGE = r"""
           <span id="status">connecting</span>
         </span>
       </div>
-      <div id="feedWrap"><img id="feed" src="/video_feed"></div>
+      <div id="feedWrap">
+        <img id="feed" src="/video_feed">
+        <div class="shortcuts">
+          <div class="hd">Shortcuts</div>
+          <div><b>L</b> lock center · <b>C</b> clear · <b>A</b> auto · <b>S</b> stop · <b>H</b> home</div>
+          <div><b>K</b> keyboard on/off · <b>Shift+&uarr;/&darr;</b> zoom · <b>Esc</b> stop · <b>P</b>/Space paint</div>
+          <div><b>Arrows</b> jog (Keyboard ON) · click image to select · <b>T</b> tracking</div>
+        </div>
+      </div>
+    </section>
+    <section style="margin-top:12px">
+      <div class="title">
+        <span>Agent (Ollama)</span>
+        <span style="display:flex;gap:6px;align-items:center">
+          <select id="agentModel" style="max-width:160px"></select>
+          <button id="bAgentToggle">Agent: OFF</button>
+        </span>
+      </div>
+      <div id="chatLog" style="height:180px;overflow-y:auto;padding:8px 12px;font-size:13px;background:#0d1013;border-bottom:1px solid var(--line)"></div>
+      <div class="row" style="padding:8px 10px">
+        <input id="chatIn" type="text" placeholder="tell the agent (e.g. paint the car)" style="flex:1;height:30px;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:6px;padding:0 8px">
+        <button id="chatSend">Send</button>
+      </div>
     </section>
   </div>
   <div>
@@ -1459,26 +1915,35 @@ HTML_PAGE = r"""
 
       <div class="sect-head">Mode</div>
       <div class="row">
-        <button id="bTrack" class="active" title="auto-track the selected target (click a target first)">Tracking: ON</button>
+        <button id="bTrack" class="active" title="Tracking ON: camera actively follows the locked target. Tracking OFF: freeze pan/tilt but keep the lock — does NOT clear or switch targets.">Tracking: ON</button>
         <button id="mHome" title="return to home pose">Home</button>
         <button id="mStop" style="background:#5a2126;border-color:#a23a3a" title="freeze in place">STOP</button>
         <button id="clear" title="forget current target">Clear</button>
         <button id="bPaint" style="background:#1f4d8c;border-color:#3a78c0" title="trigger one paint pulse (key P)">PAINT</button>
         <button id="bPaintAuto" title="auto-fire paint when selected target stays centered (stays on the SAME target)">Auto Paint: OFF</button>
-        <button id="bSweep" title="full autonomous loop: pick → center → paint → NEXT target. Remembers painted targets across sessions.">Auto Serial Tracker: OFF</button>
+        <button id="bSweep" title="Autonomous loop: pick a target → center on it → hold 2 s → PAINT → mark its id painted → advance to NEXT instance (per det_id, not per class). Forces Tracking ON.">Auto Serial Tracker: OFF</button>
         <button id="bSweepReset" title="forget painted memory">Reset memory</button>
         <button id="bMoveTgt" title="bounce the yellow ball in place">Move ball: OFF</button>
         <button id="bMoveCars" title="drive the prius+pickup in circles in front of the mantis">Move cars: OFF</button>
         <button id="bWalkPpl" title="walk the two persons forward + slight turn">Walk people: OFF</button>
-        <button id="bKeyboard" title="enable keyboard control. Arrows/WASD = jog. Space = PAINT. T = toggle Tracking. C = Clear. H = Home. Esc = STOP.">Keyboard: OFF</button>
+        <button id="bAutoZoom" title="auto-zoom in when locked target gets small, zoom out when it fills the frame">Auto Zoom: OFF</button>
+        <button id="bKeyboard" title="enable keyboard control (K toggles). Arrows = jog. Space = PAINT. T = Tracking. C = Clear. H = Home. A = Auto. S = Stop. L = Lock center. Shift+Up/Down = Zoom. Esc = STOP.">Keyboard: OFF</button>
       </div>
 
       <div class="sect-head">Detector + Tracker</div>
       <div class="row">
         <button id="dAuto" class="active" title="YOLOv12 detection + ByteTrack ID-stable tracker (Kalman + IoU)">YOLOv12 + ByteTrack</button>
+        <button id="dWorld" title="YOLO-World open-vocabulary detector — types any class as text (red truck, drone, ...). Set classes in the input below.">YOLO-World</button>
         <button id="dColor" title="HSV color detection + name+nearest-anchor tracker">HSV Color + AnchorMatch</button>
         <button id="bClickAim" title="clicks aim camera at pixel instead of selecting a target">Click-to-Aim: OFF</button>
         <span class="label" id="yoloStatus" style="align-self:center">init</span>
+      </div>
+      <div class="row" style="padding-top:0;align-items:center">
+        <label class="label" style="flex:1">Open-vocab classes (comma-sep)
+          <input id="worldClasses" type="text" value="car, person, truck, drone"
+                 style="width:100%;height:28px;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:6px;padding:0 8px;margin-top:4px">
+        </label>
+        <button id="bWorldApply" style="margin-top:18px">Apply</button>
       </div>
 
       <div class="sect-head">Jog (Manual or Auto override)</div>
@@ -1517,43 +1982,6 @@ HTML_PAGE = r"""
       <div class="title"><span>Detections</span><span>click image to select</span></div>
       <table><thead><tr><th>ID</th><th>Name</th><th>Score</th></tr></thead><tbody id="detRows"></tbody></table>
     </section>
-    <section style="margin-top:12px">
-      <div class="title">
-        <span>Agent (Ollama)</span>
-        <span style="display:flex;gap:6px;align-items:center">
-          <select id="agentModel" style="max-width:160px"></select>
-          <button id="bAgentToggle">Agent: OFF</button>
-        </span>
-      </div>
-      <div id="chatLog" style="height:180px;overflow-y:auto;padding:8px 12px;font-size:13px;background:#0d1013;border-bottom:1px solid var(--line)"></div>
-      <div class="row" style="padding:8px 10px">
-        <input id="chatIn" type="text" placeholder="tell the agent (e.g. paint the car)" style="flex:1;height:30px;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:6px;padding:0 8px">
-        <button id="chatSend">Send</button>
-      </div>
-    </section>
-
-    <section style="margin-top:12px">
-      <div class="title"><span>Output channels (paint signal)</span><span>multi-select</span></div>
-      <div class="row" style="flex-wrap:wrap">
-        <label class="label"><input type="checkbox" id="chGz" checked> gz topic</label>
-        <label class="label"><input type="checkbox" id="chFile" checked> file</label>
-        <label class="label"><input type="checkbox" id="chUdp"> UDP</label>
-        <label class="label"><input type="checkbox" id="chTcp"> TCP</label>
-        <label class="label"><input type="checkbox" id="chSerial"> serial</label>
-      </div>
-      <div class="row" style="flex-wrap:wrap">
-        <label class="label">UDP host <input id="udpHost" value="127.0.0.1" style="width:110px;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 4px"></label>
-        <label class="label">port <input id="udpPort" value="9000" style="width:70px;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 4px"></label>
-        <label class="label">TCP host <input id="tcpHost" value="127.0.0.1" style="width:110px;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 4px"></label>
-        <label class="label">port <input id="tcpPort" value="9001" style="width:70px;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 4px"></label>
-      </div>
-      <div class="row" style="flex-wrap:wrap">
-        <label class="label">Serial <input id="serPort" value="/dev/ttyUSB0" style="width:130px;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 4px"></label>
-        <label class="label">baud <input id="serBaud" value="9600" style="width:80px;background:#1d2227;color:var(--text);border:1px solid #39434e;border-radius:4px;padding:2px 4px"></label>
-        <button id="chSave">Apply</button>
-      </div>
-    </section>
-
     <section style="margin-top:12px">
       <div class="title"><span>Virtual Marks</span><span>center-hold events</span></div>
       <table><thead><tr><th>Target</th><th>Pan</th><th>Tilt</th></tr></thead><tbody id="marks"></tbody></table>
@@ -1601,6 +2029,13 @@ bSweep.onclick=async ()=>{
   sweepOn=!sweepOn;
   bSweep.textContent='Auto Serial Tracker: '+(sweepOn?'ON':'OFF');
   bSweep.classList.toggle('active',sweepOn);
+  // Sweep requires Tracking ON (mode=auto); reflect that in the UI so the
+  // two buttons stop disagreeing.
+  if(sweepOn && !trackingOn){
+    trackingOn=true;
+    bTrack.textContent='Tracking: ON';
+    bTrack.classList.toggle('active',true);
+  }
   await fetch('/api/sweep',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:sweepOn})});
 };
 bSweepReset.onclick=async ()=>{
@@ -1627,18 +2062,61 @@ bWalkPpl.onclick=async ()=>{
   bWalkPpl.classList.toggle('active',walkPplOn);
   await fetch('/api/people_walking',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:walkPplOn})});
 };
+let autoZoomOn=false;
+bAutoZoom.onclick=async ()=>{
+  autoZoomOn=!autoZoomOn;
+  bAutoZoom.textContent='Auto Zoom: '+(autoZoomOn?'ON':'OFF');
+  bAutoZoom.classList.toggle('active',autoZoomOn);
+  await fetch('/api/auto_zoom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:autoZoomOn})});
+};
 document.addEventListener('keypress',e=>{
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return;
   if(e.key==='p'||e.key==='P'){ bPaint.click(); }
 });
 
+// Connect dropdown: switch frame source between Gazebo and webcams.
+const connectMenu=document.getElementById('connectMenu');
+bConnect.onclick=(e)=>{
+  e.stopPropagation();
+  connectMenu.style.display = (connectMenu.style.display==='none' ? 'block' : 'none');
+};
+document.addEventListener('click',(e)=>{
+  if(!connectMenu.contains(e.target) && e.target!==bConnect){
+    connectMenu.style.display='none';
+  }
+});
+document.querySelectorAll('.connOpt').forEach(b=>{
+  b.onclick=async ()=>{
+    const src=b.dataset.src;
+    bConnect.textContent='Connect: probing…';
+    const r=await fetch('/api/source',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:src})}).then(r=>r.json());
+    if(r.ok){
+      const resolved = r.source;
+      const label = resolved==='gz' ? 'Gazebo Sim' :
+                    resolved.startsWith('webcam:') ? ('Webcam #'+resolved.split(':')[1]) : resolved;
+      bConnect.textContent='Connect: '+label;
+      if(r.detected){ console.log('auto-detect:', r.detected); }
+    } else {
+      bConnect.textContent='Connect: failed';
+      alert('Connect failed: '+(r.error||r.message||'unknown'));
+    }
+    connectMenu.style.display='none';
+  };
+});
+
 function setDetector(d){
   fetch('/api/detector',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:d})});
   dAuto.classList.toggle('active',d==='auto');
+  dWorld.classList.toggle('active',d==='world');
   dColor.classList.toggle('active',d==='color');
 }
 dAuto.onclick=()=>setDetector('auto');
+dWorld.onclick=()=>setDetector('world');
 dColor.onclick=()=>setDetector('color');
+bWorldApply.onclick=async ()=>{
+  const txt=document.getElementById('worldClasses').value;
+  await fetch('/api/world_classes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({classes:txt})});
+};
 
 let clickAim=false;
 let zoomVal=1.0;
@@ -1688,19 +2166,53 @@ bKeyboard.onclick=()=>{
   bKeyboard.textContent='Keyboard: '+(keyboardOn?'ON':'OFF');
   bKeyboard.classList.toggle('active',keyboardOn);
 };
+function nudgeZoom(delta){
+  const mn=parseFloat(zoomEl.min),mx=parseFloat(zoomEl.max);
+  let v=parseFloat(zoomEl.value)+delta;
+  v=Math.max(mn,Math.min(mx,Math.round(v*10)/10));
+  zoomEl.value=v;
+  applyZoom();
+}
+async function lockBestInView(){
+  // Pick the detection nearest the image-center crosshair so 'L' locks
+  // whatever the camera is aimed at, not whichever target YOLO happens to
+  // score highest.
+  const r=await fetch('/api/status'); const s=await r.json();
+  const dets=(s.detections||[]).filter(d=>d.score>=0.10);
+  if(!dets.length) return;
+  const W=1280,H=720,cxImg=W/2,cyImg=H/2;
+  const scored=dets.map(d=>{
+    const cx=(d.bbox[0]+d.bbox[2])/2, cy=(d.bbox[1]+d.bbox[3])/2;
+    return {d,cx,cy,dist:Math.hypot(cx-cxImg,cy-cyImg)};
+  });
+  scored.sort((a,b)=>a.dist-b.dist);
+  const t=scored[0];
+  fetch('/api/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:t.cx,y:t.cy})});
+}
 document.addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT'||e.target.tagName==='TEXTAREA') return;
-  if(!keyboardOn) return;
+  // Zoom + mode/lock shortcuts work without keyboard mode being toggled on.
+  if((e.shiftKey||e.ctrlKey)&&(e.key==='ArrowUp'||e.key==='ArrowDown')){
+    nudgeZoom(e.key==='ArrowUp'?+0.2:-0.2);
+    e.preventDefault();
+    return;
+  }
   const k=e.key.toLowerCase();
-  if(k==='arrowleft'||k==='a'){jog('pan-left');e.preventDefault();}
+  // Global mode/lock keys — active regardless of keyboard-jog toggle.
+  if(k==='c'){ clear.click(); return; }
+  if(k==='a'){ setMode('auto'); return; }
+  if(k==='s'){ setMode('stop'); return; }
+  if(k==='h'){ setMode('home'); return; }
+  if(k==='l'){ lockBestInView(); return; }
+  if(k==='k'){ bKeyboard.click(); return; }
+  if(k==='escape'||k==='x'){ setMode('stop'); e.preventDefault(); return; }
+  if(!keyboardOn) return;
+  if(k==='arrowleft'){jog('pan-left');e.preventDefault();}
   else if(k==='arrowright'||k==='d'){jog('pan-right');e.preventDefault();}
   else if(k==='arrowup'||k==='w'){jog('tilt-up');e.preventDefault();}
-  else if(k==='arrowdown'||k==='s'){jog('tilt-down');e.preventDefault();}
+  else if(k==='arrowdown'){jog('tilt-down');e.preventDefault();}
   else if(k===' '){bPaint.click();e.preventDefault();}
-  else if(k==='c'){clear.click();}
   else if(k==='t'){bTrack.click();}
-  else if(k==='h'){setMode('home');}
-  else if(k==='escape'||k==='x'){setMode('stop');e.preventDefault();}
   else if(k==='p'){bPaint.click();}
 });
 
@@ -1755,6 +2267,7 @@ async function poll(){
     setTrackingUI();
     yoloStatus.textContent=s.yolo_status||'';
     dAuto.classList.toggle('active',s.detector_mode==='auto');
+    dWorld.classList.toggle('active',s.detector_mode==='world');
     dColor.classList.toggle('active',s.detector_mode==='color');
     if(s.gains && !window._slidersDirty){
       gKp.value=s.gains.kp; gKpV.textContent=s.gains.kp.toFixed(2);
@@ -1768,6 +2281,16 @@ async function poll(){
       const tail=s.sweep_painted&&s.sweep_painted.length?` [${s.sweep_painted.length} done]`:'';
       bSweep.textContent='Auto Serial Tracker: '+(sweepOn?'ON':'OFF')+tail;
       bSweep.classList.toggle('active',sweepOn);
+    }
+    if(s.auto_zoom!==undefined){
+      autoZoomOn=!!s.auto_zoom;
+      bAutoZoom.textContent='Auto Zoom: '+(autoZoomOn?'ON':'OFF');
+      bAutoZoom.classList.toggle('active',autoZoomOn);
+    }
+    if(s.frame_source){
+      const lbl = s.frame_source==='gz' ? 'Gazebo Sim' :
+                  s.frame_source.startsWith('webcam:') ? ('Webcam #'+s.frame_source.split(':')[1]) : s.frame_source;
+      bConnect.textContent='Connect: '+lbl;
     }
     detRows.innerHTML=s.detections.map(d=>`<tr><td><button onclick="selectDetection(${d.id})">${d.id}</button></td><td>${d.name}</td><td>${(d.score*100).toFixed(0)}%</td></tr>`).join('');
     marks.innerHTML=s.virtual_marks.slice(0,8).map(m=>`<tr><td>${m.target}</td><td>${m.pan_deg}</td><td>${m.tilt_deg}</td></tr>`).join('');
@@ -1935,12 +2458,14 @@ def api_status():
             "detection_age_s": (time.time() - _detection_last_completed)
                                if _detection_last_completed else None,
             "zoom": zoom_factor,
+            "auto_zoom": auto_zoom_enabled,
+            "frame_source": frame_source,
             "eff_hfov_deg": math.degrees(_eff_hfov),
             "eff_vfov_deg": math.degrees(_eff_vfov),
             "paint_count": paint_count,
             "paint_auto": paint_auto,
             "sweep_enabled": sweep_enabled,
-            "sweep_painted": sorted(sweep_painted_names),
+            "sweep_painted": sorted(sweep_painted_ids),
         })
 
 
@@ -2310,17 +2835,24 @@ def api_paint():
 
 @app.post("/api/sweep")
 def api_sweep():
-    global sweep_enabled, sweep_painted_names, sweep_last_advance_ts
+    global sweep_enabled, sweep_painted_names, sweep_painted_ids
+    global sweep_last_advance_ts, sweep_scan_start_ts, mode
     data = request.get_json(force=True, silent=True) or {}
     with lock:
         if "enabled" in data:
             sweep_enabled = bool(data["enabled"])
+            if sweep_enabled and mode != "auto":
+                mode = "auto"
+            if not sweep_enabled:
+                sweep_scan_start_ts = 0.0
         if data.get("reset_painted"):
             sweep_painted_names = set()
+            sweep_painted_ids = set()
             sweep_last_advance_ts = 0.0
+            sweep_scan_start_ts = 0.0
             _save_painted_memory()
     return jsonify({"ok": True, "sweep_enabled": sweep_enabled,
-                    "painted_names": sorted(sweep_painted_names),
+                    "painted_ids": sorted(sweep_painted_ids),
                     "mode": mode})
 
 
@@ -2363,51 +2895,58 @@ def api_people_walking():
     return jsonify({"ok": True, "people_walking": people_walking})
 
 
+def _apply_zoom_locked(new_z: float) -> None:
+    """Apply a zoom change. Caller must hold `lock`. Re-maps every pixel
+    coord the controller is holding so the same world ray maps to the new
+    zoomed-frame pixel — otherwise the anchor refers to the old crop and
+    the controller slews off the target."""
+    global zoom_factor, selected_anchor_xy, smoothed_cx, smoothed_cy
+    global target_vx_pix_s, target_vy_pix_s
+    global pan_i_deg, tilt_i_deg, last_ex_norm, last_ey_norm, zoom_changed_ts
+    global last_target_w, last_target_h, pan_deg, tilt_deg
+    old_z = max(0.01, zoom_factor)
+    ratio = new_z / old_z
+    cx_img = IMG_W / 2.0
+    cy_img = IMG_H / 2.0
+    if selected_anchor_xy is not None:
+        ax, ay = selected_anchor_xy
+        selected_anchor_xy = (cx_img + (ax - cx_img) * ratio,
+                              cy_img + (ay - cy_img) * ratio)
+    if smoothed_init:
+        smoothed_cx = cx_img + (smoothed_cx - cx_img) * ratio
+        smoothed_cy = cy_img + (smoothed_cy - cy_img) * ratio
+    target_vx_pix_s *= ratio
+    target_vy_pix_s *= ratio
+    last_target_w *= ratio
+    last_target_h *= ratio
+    pan_i_deg = 0.0
+    tilt_i_deg = 0.0
+    last_ex_norm = 0.0
+    last_ey_norm = 0.0
+    if joint_state_stamp:
+        pan_deg = actual_pan_deg
+        tilt_deg = actual_tilt_deg
+    zoom_factor = new_z
+    if abs(new_z - old_z) > 0.01:
+        zoom_changed_ts = time.time()
+
+
 @app.post("/api/zoom")
 def api_zoom():
-    global zoom_factor, selected_anchor_xy, smoothed_cx, smoothed_cy
-    global smoothed_init, target_vx_pix_s, target_vy_pix_s
-    global pan_i_deg, tilt_i_deg, last_ex_norm, last_ey_norm, zoom_changed_ts
     data = request.get_json(force=True, silent=True) or {}
     new_z = safe_float(data, "zoom", zoom_factor, ZOOM_MIN, ZOOM_MAX)
     with lock:
-        old_z = max(0.01, zoom_factor)
-        ratio = new_z / old_z
-        # Re-map every pixel-coord that the controller is holding so that
-        # the same WORLD ray maps to the new zoomed-frame pixel. Without
-        # this the anchor referred to the old crop and the controller would
-        # see a huge artificial error and slew the camera off the target.
-        cx_img = IMG_W / 2.0
-        cy_img = IMG_H / 2.0
-        if selected_anchor_xy is not None:
-            ax, ay = selected_anchor_xy
-            selected_anchor_xy = (cx_img + (ax - cx_img) * ratio,
-                                  cy_img + (ay - cy_img) * ratio)
-        if smoothed_init:
-            smoothed_cx = cx_img + (smoothed_cx - cx_img) * ratio
-            smoothed_cy = cy_img + (smoothed_cy - cy_img) * ratio
-        # pixel velocity scales with image-pixels-per-degree (same ratio).
-        target_vx_pix_s *= ratio
-        target_vy_pix_s *= ratio
-        global last_target_w, last_target_h
-        last_target_w *= ratio
-        last_target_h *= ratio
-        pan_i_deg = 0.0
-        tilt_i_deg = 0.0
-        last_ex_norm = 0.0
-        last_ey_norm = 0.0
-        global pan_deg, tilt_deg
-        if joint_state_stamp:
-            pan_deg = actual_pan_deg
-            tilt_deg = actual_tilt_deg
-        zoom_factor = new_z
-        if abs(new_z - old_z) > 0.01:
-            zoom_changed_ts = time.time()
-        # ByteTrack keeps the same ID across moderate zoom changes if the
-        # target is still detected. Don't drop selected_id — that forced the
-        # resolver into name+anchor fallback which often locked onto a
-        # neighbour. Anchor remap above is enough.
+        _apply_zoom_locked(new_z)
     return jsonify({"ok": True, "zoom": zoom_factor})
+
+
+@app.post("/api/auto_zoom")
+def api_auto_zoom():
+    global auto_zoom_enabled
+    data = request.get_json(force=True, silent=True) or {}
+    if "enabled" in data:
+        auto_zoom_enabled = bool(data["enabled"])
+    return jsonify({"ok": True, "auto_zoom": auto_zoom_enabled})
 
 
 @app.get("/api/channels")
@@ -2736,19 +3275,104 @@ def api_detector():
     global detector_mode, detections
     data = request.get_json(force=True, silent=True) or {}
     requested = str(data.get("mode", "")).lower()
-    if requested not in ("auto", "color"):
-        return jsonify({"ok": False, "message": "detector mode must be auto|color"}), 400
+    if requested not in ("auto", "color", "world"):
+        return jsonify({"ok": False, "message": "detector mode must be auto|color|world"}), 400
     with lock:
         if detector_mode != requested:
-            # Drop the stale detection list; next frame populates with the new
-            # detector. Avoids visible delay where bboxes from the old detector
-            # remain while the new one loads.
             detections = []
         detector_mode = requested
     return jsonify({"ok": True, "detector_mode": detector_mode,
                     "yolo_status": yolo_status,
-                    "tracker": ("ByteTrack" if detector_mode == "auto"
+                    "tracker": ("ByteTrack" if detector_mode in ("auto", "world")
                                 else "AnchorMatch")})
+
+
+def _gz_camera_alive() -> bool:
+    """True if /mantis/nose_camera/image has produced a frame within the
+    last second. Used by auto-detect to know if Gazebo is up."""
+    return latest_stamp > 0 and (time.time() - latest_stamp) < 1.5
+
+
+def _probe_webcam(idx: int) -> bool:
+    """Open camera idx briefly to check if it responds with a frame."""
+    try:
+        cap = cv2.VideoCapture(idx)
+        if not cap.isOpened():
+            return False
+        ok, frame = cap.read()
+        cap.release()
+        return bool(ok and frame is not None)
+    except Exception:
+        return False
+
+
+def _auto_detect_source() -> tuple[str, str]:
+    """Return (source_string, message). Prefers Gazebo + Mantis joints, then
+    falls back to webcam 0, 1, 2."""
+    if _gz_camera_alive() and joint_state_stamp > 0:
+        return "gz", "Gazebo + Mantis joints live"
+    if _gz_camera_alive():
+        return "gz", "Gazebo camera live (no joint state)"
+    for idx in (0, 1, 2):
+        if _probe_webcam(idx):
+            return f"webcam:{idx}", f"webcam #{idx} responds"
+    return "", "no source responded (gz topic silent, no webcam)"
+
+
+@app.post("/api/source")
+def api_source():
+    """Switch the live frame source. Accepts:
+      {"source": "gz"}
+      {"source": "webcam:<index>"}
+      {"source": "auto"}     — probes gz first, then webcam 0/1/2.
+    Gazebo stays connected via gz_transport in the background; the webcam
+    thread takes priority by overwriting latest_raw."""
+    global frame_source
+    data = request.get_json(force=True, silent=True) or {}
+    src = str(data.get("source", "")).lower().strip()
+    detected_msg = ""
+    if src == "auto":
+        src, detected_msg = _auto_detect_source()
+        if not src:
+            return jsonify({"ok": False, "error": detected_msg}), 400
+    if src == "gz":
+        _stop_webcam()
+        frame_source = "gz"
+        return jsonify({"ok": True, "source": frame_source,
+                        "detected": detected_msg})
+    if src.startswith("webcam:"):
+        try:
+            idx = int(src.split(":", 1)[1])
+        except Exception:
+            return jsonify({"ok": False, "error": "bad webcam index"}), 400
+        _start_webcam(idx)
+        time.sleep(0.5)
+        if _webcam_last_error:
+            return jsonify({"ok": False, "error": _webcam_last_error}), 400
+        frame_source = src
+        return jsonify({"ok": True, "source": frame_source,
+                        "detected": detected_msg})
+    return jsonify({"ok": False, "error": "source must be auto|gz|webcam:N"}), 400
+
+
+@app.post("/api/world_classes")
+def api_world_classes():
+    """Update the open-vocab class prompts used by YOLO-World. Accepts
+    {"classes": ["red truck", "person", ...]}. Empty list keeps current."""
+    global _yoloworld_classes
+    data = request.get_json(force=True, silent=True) or {}
+    raw = data.get("classes")
+    if isinstance(raw, str):
+        raw = [s.strip() for s in raw.split(",") if s.strip()]
+    if isinstance(raw, list) and raw:
+        with lock:
+            _yoloworld_classes = [str(x).strip() for x in raw if str(x).strip()]
+    return jsonify({"ok": True, "classes": list(_yoloworld_classes)})
+
+
+@app.get("/api/world_classes")
+def api_world_classes_get():
+    return jsonify({"classes": list(_yoloworld_classes)})
 
 
 @app.post("/api/command")
