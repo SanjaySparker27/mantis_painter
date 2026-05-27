@@ -148,7 +148,7 @@ smoothed_cy = 0.0
 smoothed_init = False
 last_target_w = 60.0
 last_target_h = 60.0
-PERSIST_HORIZON_S = 1.0  # forward-fill detection up to this long after a miss
+PERSIST_HORIZON_S = 3.0  # forward-fill detection up to this long after a miss
 pan_i_deg = 0.0
 tilt_i_deg = 0.0
 last_ex_norm = 0.0
@@ -268,7 +268,7 @@ def detect_with_yolo(frame: np.ndarray) -> list[Detection] | None:
             source=frame,
             persist=True,
             tracker=_yolo_tracker_cfg,
-            conf=0.15,
+            conf=0.08,  # very permissive — let ByteTrack filter weak hits
             iou=0.4,
             imgsz=384,
             verbose=False,
@@ -477,10 +477,11 @@ def _bytetrack_reset() -> None:
         pass
 
 
-MAX_ANCHOR_REASSOC_PX = 110.0           # tightened so a sibling car can't steal
-MAX_ANCHOR_REASSOC_CROSS_CLASS_PX = 70.0
-BBOX_SIZE_RATIO_TOL = 0.60              # candidate bbox must be similar size to last seen
-MIN_TRACK_SCORE = 0.10  # lower so Gazebo renders with weak YOLO confidence still track
+MAX_ANCHOR_REASSOC_PX = 160.0           # spinning car can shift bbox quite a bit
+MAX_ANCHOR_REASSOC_CROSS_CLASS_PX = 100.0
+BBOX_SIZE_RATIO_TOL = 0.40              # spinning car's bbox W/H change with viewing angle
+MIN_TRACK_SCORE = 0.05                  # YOLO score dips below 0.10 mid-spin
+AMBIGUITY_MARGIN = 1.25                 # was 1.6 — fewer false "too ambiguous" rejections
 
 
 def _nearest_to_anchor(cands, ax, ay):
@@ -528,9 +529,15 @@ def _ghost_target() -> Detection | None:
 def resolve_selected_target() -> Detection | None:
     if selected_name is None and selected_id is None:
         return None
-    strong = [d for d in detections if d.score >= MIN_TRACK_SCORE]
+    # If the current frame has no detections at all but we have a very fresh
+    # recent_detections cache, search there first — bridges one-frame YOLO
+    # drops without falling into ghost mode.
+    pool = detections
+    if not pool and (time.time() - recent_detection_stamp) < 0.4:
+        pool = recent_detections
+    strong = [d for d in pool if d.score >= MIN_TRACK_SCORE]
     if not strong:
-        strong = list(detections)
+        strong = list(pool)
 
     # During the ZOOM_GRACE window right after a zoom change, ByteTrack is
     # likely to have dropped the ID and the bbox geometry is in a new scale,
@@ -578,7 +585,7 @@ def resolve_selected_target() -> Detection | None:
                             # second-best; otherwise the situation is too
                             # ambiguous and we'd risk locking onto the wrong
                             # sibling.
-                            if d_second < d_best * 1.6 and not in_zoom_grace:
+                            if d_second < d_best * AMBIGUITY_MARGIN and not in_zoom_grace:
                                 pass  # ambiguous — fall through to ghost
                             else:
                                 return best
