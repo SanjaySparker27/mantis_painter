@@ -1118,12 +1118,15 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
         if _auto_yaw_target is None and abs(pan_deg) > PAN_FOLLOW_THRESHOLD_DEG:
             _auto_yaw_target = -pan_deg
     if _auto_yaw_target is not None:
+        # Normalize the target into [-180, 180] so the chassis never wraps
+        # multiple times trying to "catch up" past the short way.
+        wrapped = ((_auto_yaw_target + 180.0) % 360.0) - 180.0
         _span = max(1.0, PAN_LIMIT[1] - PAN_FOLLOW_THRESHOLD_DEG)
         _overshoot = clamp(
-            (abs(_auto_yaw_target) - PAN_FOLLOW_THRESHOLD_DEG) / _span,
+            (abs(wrapped) - PAN_FOLLOW_THRESHOLD_DEG) / _span,
             0.0, 1.0)
         mantis_auto_yaw_rate = math.copysign(
-            PAN_FOLLOW_GAIN * _overshoot, _auto_yaw_target)
+            PAN_FOLLOW_GAIN * _overshoot, wrapped)
     else:
         mantis_auto_yaw_rate *= 0.7
 
@@ -1966,6 +1969,10 @@ def _mantis_drive_loop():
             mantis_chassis_x += wx * dt
             mantis_chassis_y += wy * dt
             mantis_chassis_yaw += eff_vyaw * dt
+            # Wrap chassis yaw into [-pi, pi] so accumulated rotation
+            # doesn't blow up over time (runaway 886-degree spins).
+            mantis_chassis_yaw = ((mantis_chassis_yaw + math.pi)
+                                  % (2 * math.pi)) - math.pi
             req = (f'name: "mantis_robot" '
                    f'position {{ x: {mantis_chassis_x:.3f} y: {mantis_chassis_y:.3f} z: 0.0 }} '
                    f'orientation {{ z: {_m.sin(mantis_chassis_yaw/2):.4f} '
