@@ -775,11 +775,18 @@ def _confirm_new_id(cand: "Detection") -> "Detection | None":
     if sweep_enabled and sweep_center_hold_start_ts > 0:
         g = _ghost_target()
         return g if g is not None else cand
-    # NOTE: an earlier "ego lock-down" used to short-circuit to ghost while
-    # the chassis was moving. That made pan/tilt blind to the re-emerging
-    # bbox after a brief YOLO id drop — visible as "lost the lock while I
-    # was driving." Removed. The signature + IoU + hysteresis gates above
-    # already keep Pass 1/2/3 from rebinding to a sibling.
+    # Ego lock-down: while the chassis is yawing or driving fast, refuse
+    # to rebind onto a sibling that scrolls into the predicted bbox area
+    # as the world bearing changes. selected_id stays put; pan/tilt yaw
+    # feed-forward keeps the nose on the locked target's world bearing.
+    # Only activates above a fast-motion threshold so a gentle nudge still
+    # lets the resolver recover after a YOLO id drop.
+    if (mantis_moving
+        or abs(mantis_drive_vyaw) > 0.15      # rotating chassis
+        or abs(mantis_drive_vx) > 4.0         # fast forward/back
+        or abs(mantis_drive_vy) > 4.0):
+        g = _ghost_target()
+        return g if g is not None else cand
     # Count any frame where the resolver wants to rebind, even if YOLO is
     # thrashing the det_id between frames. Without this, hysteresis never
     # confirms when ByteTrack assigns a new id each frame (e.g. after a
