@@ -1412,26 +1412,24 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     rate_boost = 2.5 if ego_active else 1.0
     pan_max_step = pan_gains.max_rate_deg_s * dt * zoom_scale * rate_boost
     tilt_max_step = tilt_gains.max_rate_deg_s * dt * zoom_scale * rate_boost
-    # Feed-forward: chassis yaw rotates the camera in world frame. Subtract
-    # it from the pan command directly so the nose stays glued to the
-    # world-frame bearing without waiting for the feedback loop to detect
-    # the bbox shift. dyaw is in rad/s; convert to deg/s and to per-frame
-    # step. Sign flipped to match camera convention.
-    yaw_ff_deg = -math.degrees(mantis_drive_vyaw) * dt
-    desired_pan_ff = desired_pan + yaw_ff_deg
-    pan_step_raw = clamp(desired_pan_ff - pan_deg, -pan_max_step, pan_max_step)
+    pan_step_raw = clamp(desired_pan - pan_deg, -pan_max_step, pan_max_step)
     tilt_step_raw = clamp(desired_tilt - tilt_deg, -tilt_max_step, tilt_max_step)
     base_lpf = 0.32 / max(1.0, math.sqrt(zoom_factor))
     lpf = min(0.7, base_lpf * 1.8) if ego_active else base_lpf
+    # Yaw feed-forward applied DIRECTLY to pan_deg, bypassing the LPF so
+    # the per-frame compensation isn't attenuated to 30 % of its needed
+    # magnitude. PAN_SIGN already negative, so a +vyaw chassis rotation
+    # subtracts from pan_deg to hold the world-frame bearing.
+    yaw_ff_deg = math.degrees(mantis_drive_vyaw) * dt * PAN_SIGN
 
     # Inside deadband: freeze command at actual joint position and decay
     # integral fast so we don't accumulate noise into the next motion.
     if in_deadband_x:
-        pan_deg = clamp(0.85 * pan_deg + 0.15 * actual_pan,
+        pan_deg = clamp(0.85 * pan_deg + 0.15 * actual_pan + yaw_ff_deg,
                         PAN_LIMIT[0], PAN_LIMIT[1])
         pan_i_deg *= 0.80
     else:
-        pan_deg = clamp(pan_deg + lpf * pan_step_raw,
+        pan_deg = clamp(pan_deg + lpf * pan_step_raw + yaw_ff_deg,
                         PAN_LIMIT[0], PAN_LIMIT[1])
     if in_deadband_y:
         tilt_deg = clamp(0.85 * tilt_deg + 0.15 * actual_tilt,
