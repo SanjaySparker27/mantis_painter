@@ -1360,13 +1360,18 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
                   or abs(mantis_drive_vx) > 0.1
                   or abs(mantis_drive_vy) > 0.1
                   or abs(mantis_drive_vyaw) > 0.05)
-    # Yaw feed-forward already compensates for chassis rotation. Boosting
-    # Kp further made PID + FF compound and overshoot. Pull Kp boost back
-    # to 1.4x — just enough headroom for residual bbox correction without
-    # fighting the FF. Kd stays high for damping.
-    ego_boost = 1.4 if ego_active else 1.0
-    kd_boost = 2.0 if ego_active else 1.0
-    PID_OUT_CLAMP_DEG = 18.0 if ego_active else 6.0
+    # During ego motion, yaw_ff does the bulk of pan compensation. PID
+    # only needs to nudge residual bbox error — boosted PID compounded
+    # with FF and pushed pan past the target. Suppress Kp to 0.7x and
+    # keep Kd boosted for damping. Tight PID clamp limits per-frame
+    # PID contribution so it can't outrun the yaw_ff.
+    # During ego motion: pan/tilt driven almost entirely by yaw_ff +
+    # measured target velocity in pixel space. PID kept very small —
+    # any boost compounded with yaw_ff and produced overshoot that put
+    # the target off-screen. Use 0.3x Kp (residual nudge only).
+    ego_boost = 0.3 if ego_active else 1.0
+    kd_boost = 1.5 if ego_active else 1.0
+    PID_OUT_CLAMP_DEG = 2.5 if ego_active else 6.0
     pan_u_deg = clamp(
         ego_boost * pan_gains.kp * pan_err_deg
         + pan_gains.ki * pan_i_deg
