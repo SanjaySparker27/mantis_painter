@@ -1441,9 +1441,18 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
         # Without this, the stored target_world_pan_deg drifts wrong when
         # the chassis rotates between detections — pursuit and re-acquire
         # then point the camera at the wrong world bearing.
-        chassis_yaw_deg = math.degrees(mantis_chassis_yaw)
-        new_world_pan = chassis_yaw_deg + actual_pan + PAN_SIGN * pan_err_deg
-        new_world_tilt = actual_tilt + TILT_SIGN * tilt_err_deg
+        # During fast chassis motion (ego_active) the resolver tends to
+        # rebind onto sibling targets each frame; each rebind would
+        # ratchet target_world_pan_deg in the chassis direction, drifting
+        # the stored bearing away from the real one. Freeze the update
+        # until the vehicle settles.
+        if ego_active:
+            new_world_pan = target_world_pan_deg
+            new_world_tilt = target_world_tilt_deg
+        else:
+            chassis_yaw_deg = math.degrees(mantis_chassis_yaw)
+            new_world_pan = chassis_yaw_deg + actual_pan + PAN_SIGN * pan_err_deg
+            new_world_tilt = actual_tilt + TILT_SIGN * tilt_err_deg
         now_bts = time.time()
         if target_world_pan_deg is not None and last_bearing_ts > 0:
             dt_b = max(1e-3, now_bts - last_bearing_ts)
