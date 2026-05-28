@@ -1452,10 +1452,13 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     base_lpf = 0.32 / max(1.0, math.sqrt(zoom_factor))
     lpf = min(0.7, base_lpf * 1.8) if ego_active else base_lpf
     # Yaw feed-forward applied DIRECTLY to pan_deg, bypassing the LPF so
-    # the per-frame compensation isn't attenuated to 30 % of its needed
-    # magnitude. PAN_SIGN already negative, so a +vyaw chassis rotation
-    # subtracts from pan_deg to hold the world-frame bearing.
-    yaw_ff_deg = math.degrees(mantis_drive_vyaw) * dt * PAN_SIGN
+    # the per-frame compensation isn't attenuated. Measured: chassis
+    # actually yaws at ~80 % of commanded vyaw because the gz set_pose
+    # subprocess in the drive loop adds latency. Scale FF accordingly so
+    # pan doesn't over-compensate and leave the target at the OPPOSITE
+    # edge of the frame.
+    YAW_FF_CALIB = 0.8
+    yaw_ff_deg = math.degrees(mantis_drive_vyaw) * dt * PAN_SIGN * YAW_FF_CALIB
 
     # Inside deadband: freeze command at actual joint position and decay
     # integral fast so we don't accumulate noise into the next motion.
