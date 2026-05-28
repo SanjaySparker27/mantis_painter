@@ -314,7 +314,7 @@ def _load_painted_memory():
 
 _load_painted_memory()
 
-LOST_GRACE_S = 6.0  # hold selection through long detection gaps (don't drop to home)
+LOST_GRACE_S = 60.0  # hold selection through long detection gaps (don't drop to home). Persistent memory: keep the lock + world bearing for a minute so auto-yaw can rotate the chassis back even after a long absence. User can always Clear manually.
 
 YOLO_WEIGHTS_TRY = [
     "yolo12n.pt",
@@ -1102,6 +1102,31 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
         clear_selection()
         return
 
+    # Auto chassis-yaw — computed EARLY so it fires in every branch
+    # (including target=None pursuit), not only when we have a live
+    # target object. Without this, after a fast yaw lost the target the
+    # chassis sat still while pursuit asked for an impossible pan angle.
+    global mantis_auto_yaw_rate
+    user_yawing = abs(mantis_drive_vyaw) > 0.05
+    _auto_yaw_target = None
+    if not user_yawing and selected_id is not None:
+        if target_world_pan_deg is not None:
+            chassis_frame_target = (target_world_pan_deg
+                                    - math.degrees(mantis_chassis_yaw))
+            if abs(chassis_frame_target) > PAN_FOLLOW_THRESHOLD_DEG:
+                _auto_yaw_target = chassis_frame_target
+        if _auto_yaw_target is None and abs(pan_deg) > PAN_FOLLOW_THRESHOLD_DEG:
+            _auto_yaw_target = -pan_deg
+    if _auto_yaw_target is not None:
+        _span = max(1.0, PAN_LIMIT[1] - PAN_FOLLOW_THRESHOLD_DEG)
+        _overshoot = clamp(
+            (abs(_auto_yaw_target) - PAN_FOLLOW_THRESHOLD_DEG) / _span,
+            0.0, 1.0)
+        mantis_auto_yaw_rate = math.copysign(
+            PAN_FOLLOW_GAIN * _overshoot, _auto_yaw_target)
+    else:
+        mantis_auto_yaw_rate *= 0.7
+
     # Auto-zoom: shrink/expand the digital zoom so the locked target's bbox
     # stays inside a usable size band. Only react to real detections (not
     # ghosts) and respect a cooldown so we don't oscillate.
@@ -1482,33 +1507,6 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
                          TILT_LIMIT[0], TILT_LIMIT[1])
     publish_pan_tilt()
 
-    # Auto chassis-yaw follow: when pan saturates while ACTIVELY tracking
-    # a locked target (recent real detection), rotate the chassis so the
-    # nose can return toward neutral. Sign: pan_deg < 0 -> rotate chassis
-    # in same world direction as the target. Adds to user V-drive yaw so
-    # the operator can still override.
-    global mantis_auto_yaw_rate
-    target_fresh = (selected_id is not None
-                    and last_target_seen_ts > 0
-                    and (now - last_target_seen_ts) < 0.6)
-    # Only auto-yaw when the user isn't actively steering. Otherwise
-    # auto_yaw fights the user's V-drive input which is confusing.
-    user_yawing = abs(mantis_drive_vyaw) > 0.05
-    if target_fresh and not user_yawing:
-        pan_abs = abs(pan_deg)
-        if pan_abs > PAN_FOLLOW_THRESHOLD_DEG:
-            span = max(1.0, PAN_LIMIT[1] - PAN_FOLLOW_THRESHOLD_DEG)
-            overshoot = clamp((pan_abs - PAN_FOLLOW_THRESHOLD_DEG) / span,
-                              0.0, 1.0)
-            # PAN_SIGN = -1 so pan_deg < 0 means camera is looking RIGHT of
-            # the chassis nose. Chassis must yaw in the SAME direction as
-            # pan_deg to bring its nose around to where the camera points.
-            mantis_auto_yaw_rate = math.copysign(
-                PAN_FOLLOW_GAIN * overshoot, pan_deg)
-        else:
-            mantis_auto_yaw_rate *= 0.7
-    else:
-        mantis_auto_yaw_rate *= 0.7  # decay when user is steering or no target
 
     if abs(nx) < pan_gains.deadband_norm and abs(ny) < tilt_gains.deadband_norm:
         centered_frames += 1
@@ -2851,6 +2849,10 @@ def api_status():
             "paint_auto": paint_auto,
             "sweep_enabled": sweep_enabled,
             "sweep_painted": sorted(sweep_painted_ids),
+            "mantis_chassis_yaw_deg": math.degrees(mantis_chassis_yaw),
+            "mantis_auto_yaw_rate": mantis_auto_yaw_rate,
+            "mantis_drive_vyaw": mantis_drive_vyaw,
+            "target_world_pan_deg": target_world_pan_deg,
             "cars_moving": cars_moving,
             "people_walking": people_walking,
             "moving_target": target_moving,
