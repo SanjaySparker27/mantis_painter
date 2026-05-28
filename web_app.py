@@ -1399,13 +1399,15 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     # with FF and pushed pan past the target. Suppress Kp to 0.7x and
     # keep Kd boosted for damping. Tight PID clamp limits per-frame
     # PID contribution so it can't outrun the yaw_ff.
-    # During ego motion: pan/tilt driven almost entirely by yaw_ff +
-    # measured target velocity in pixel space. PID kept very small —
-    # any boost compounded with yaw_ff and produced overshoot that put
-    # the target off-screen. Use 0.3x Kp (residual nudge only).
-    ego_boost = 0.3 if ego_active else 1.0
-    kd_boost = 1.5 if ego_active else 1.0
-    PID_OUT_CLAMP_DEG = 2.5 if ego_active else 6.0
+    # Hackaday-style PID: simple image-error -> joint angle. No ego
+    # boost, no yaw feed-forward — same gains whether the vehicle is
+    # moving or not. PID is responsible for chasing the target through
+    # both bbox jitter AND chassis-induced apparent motion. Generous
+    # max_rate on the joints (raised in api_gains reset) gives the PID
+    # enough headroom to keep up.
+    ego_boost = 1.0
+    kd_boost = 1.0
+    PID_OUT_CLAMP_DEG = 8.0
     pan_u_deg = clamp(
         ego_boost * pan_gains.kp * pan_err_deg
         + pan_gains.ki * pan_i_deg
@@ -1461,45 +1463,23 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     # Aggressive rate scaling: pixel-per-degree grows with zoom, so any
     # over-correction looks proportionally larger. Scale max slew by 1/z^1.4.
     zoom_scale = 1.0 / (max(1.0, zoom_factor) ** 1.4)
-    # Ego boost also widens the per-step rate cap + sharpens the LPF so the
-    # joint can actually deliver the higher PID output. Joint hardware
-    # limits are pan 2.5 rad/s (143 deg/s), tilt 2.0 rad/s (114 deg/s) —
-    # well above the boosted gains so the actuator isn't the bottleneck.
-    rate_boost = 2.5 if ego_active else 1.0
-    pan_max_step = pan_gains.max_rate_deg_s * dt * zoom_scale * rate_boost
-    tilt_max_step = tilt_gains.max_rate_deg_s * dt * zoom_scale * rate_boost
+    # Hackaday-style: simple pan/tilt slew limited by max_rate. No ego
+    # rate boost, no yaw feed-forward. PID alone reacts to the bbox
+    # error - even when the bbox moves quickly because the vehicle is
+    # turning, the same loop catches it. The joints have plenty of
+    # bandwidth (default 100 deg/s after the api_gains reset bump).
+    pan_max_step = pan_gains.max_rate_deg_s * dt * zoom_scale
+    tilt_max_step = tilt_gains.max_rate_deg_s * dt * zoom_scale
     pan_step_raw = clamp(desired_pan - pan_deg, -pan_max_step, pan_max_step)
     tilt_step_raw = clamp(desired_tilt - tilt_deg, -tilt_max_step, tilt_max_step)
-    # When the target is a ghost (lock-down or detection gap), pan_u_deg = 0
-    # so desired_pan = actual_pan. Stepping toward actual pulls pan_cmd
-    # back, fighting the yaw feed-forward. Zero the step in that case so
-    # only yaw_ff drives the command.
-    if target is not None and target.score == 0 and ego_active:
-        pan_step_raw = 0.0
-        tilt_step_raw = 0.0
-    base_lpf = 0.32 / max(1.0, math.sqrt(zoom_factor))
-    lpf = min(0.7, base_lpf * 1.8) if ego_active else base_lpf
-    # Yaw feed-forward applied DIRECTLY to pan_deg, bypassing the LPF so
-    # the per-frame compensation isn't attenuated. Measured: chassis
-    # actually yaws at ~80 % of commanded vyaw because the gz set_pose
-    # subprocess in the drive loop adds latency. Scale FF accordingly so
-    # pan doesn't over-compensate and leave the target at the OPPOSITE
-    # edge of the frame.
-    YAW_FF_CALIB = 0.8
-    yaw_ff_deg = math.degrees(mantis_drive_vyaw) * dt * PAN_SIGN * YAW_FF_CALIB
+    lpf = 0.32 / max(1.0, math.sqrt(zoom_factor))
 
-    # Inside deadband: freeze command at actual joint position and decay
-    # integral fast so we don't accumulate noise into the next motion.
-    # EXCEPTION: during ego motion the deadband branch was pulling pan_cmd
-    # back toward actual_pan, which fought the yaw feed-forward and
-    # throttled compensation to ~10 deg/s instead of the needed ~57 deg/s.
-    # Skip the actual-pan blend during ego so the FF runs at full rate.
-    if in_deadband_x and not ego_active:
-        pan_deg = clamp(0.85 * pan_deg + 0.15 * actual_pan + yaw_ff_deg,
+    if in_deadband_x:
+        pan_deg = clamp(0.85 * pan_deg + 0.15 * actual_pan,
                         PAN_LIMIT[0], PAN_LIMIT[1])
         pan_i_deg *= 0.80
     else:
-        pan_deg = clamp(pan_deg + lpf * pan_step_raw + yaw_ff_deg,
+        pan_deg = clamp(pan_deg + lpf * pan_step_raw,
                         PAN_LIMIT[0], PAN_LIMIT[1])
     if in_deadband_y:
         tilt_deg = clamp(0.85 * tilt_deg + 0.15 * actual_tilt,
@@ -3023,13 +3003,14 @@ def api_gains():
     data = request.get_json(force=True, silent=True) or {}
     with lock:
         if data.get("reset"):
-            # Higher max_rate so the nose can keep up with the chassis (V
-            # drive) and bus motion; tilt gets a separate cap because the
-            # joint is bandwidth-limited.
-            pan_gains.kp = 0.65; pan_gains.ki = 0.20; pan_gains.kd = 0.15
-            pan_gains.max_rate_deg_s = 60.0; pan_gains.deadband_norm = 0.008
-            tilt_gains.kp = 0.60; tilt_gains.ki = 0.18; tilt_gains.kd = 0.15
-            tilt_gains.max_rate_deg_s = 45.0; tilt_gains.deadband_norm = 0.012
+            # Hackaday-tuned defaults: moderate Kp + Kd, generous Ki, very
+            # high max_rate so the joints can chase fast image motion
+            # caused by chassis turning. Joint hardware caps are pan
+            # 2.5 rad/s (143 deg/s) and tilt 2.0 rad/s (114 deg/s).
+            pan_gains.kp = 0.55; pan_gains.ki = 0.18; pan_gains.kd = 0.18
+            pan_gains.max_rate_deg_s = 100.0; pan_gains.deadband_norm = 0.008
+            tilt_gains.kp = 0.55; tilt_gains.ki = 0.18; tilt_gains.kd = 0.18
+            tilt_gains.max_rate_deg_s = 90.0; tilt_gains.deadband_norm = 0.012
             reset_controller_state()
             return jsonify({"ok": True, "reset": True})
         for key in ("kp", "ki", "kd"):
