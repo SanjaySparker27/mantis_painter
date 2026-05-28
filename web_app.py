@@ -1138,10 +1138,16 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
                 dt_lost = now - last_bearing_ts
                 if dt_lost <= PURSUIT_MAX_S:
                     decay = math.exp(-dt_lost / PURSUIT_DECAY_S)
-                    pred_pan = (target_world_pan_deg
-                                + target_pan_rate_deg_s * dt_lost * decay)
-                    pred_tilt = (target_world_tilt_deg
-                                 + target_tilt_rate_deg_s * dt_lost * decay)
+                    pred_world_pan = (target_world_pan_deg
+                                      + target_pan_rate_deg_s * dt_lost * decay)
+                    pred_world_tilt = (target_world_tilt_deg
+                                       + target_tilt_rate_deg_s * dt_lost * decay)
+                    # Convert world bearing -> current chassis-frame pan
+                    # so the camera holds the target's last world bearing
+                    # even as the chassis continues to rotate underneath.
+                    chassis_yaw_deg_now = math.degrees(mantis_chassis_yaw)
+                    pred_pan = pred_world_pan - chassis_yaw_deg_now
+                    pred_tilt = pred_world_tilt
                     pred_pan = clamp(pred_pan, PAN_LIMIT[0], PAN_LIMIT[1])
                     pred_tilt = clamp(pred_tilt, TILT_LIMIT[0], TILT_LIMIT[1])
                     pan_max_step = pan_gains.max_rate_deg_s * dt
@@ -1401,7 +1407,12 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     # plus the angular offset corresponding to its pixel error. Track its
     # rate so pursuit can continue when the bbox briefly vanishes.
     if target.score > 0:
-        new_world_pan = actual_pan + PAN_SIGN * pan_err_deg
+        # True world bearing = chassis_yaw + chassis-frame pan angle.
+        # Without this, the stored target_world_pan_deg drifts wrong when
+        # the chassis rotates between detections — pursuit and re-acquire
+        # then point the camera at the wrong world bearing.
+        chassis_yaw_deg = math.degrees(mantis_chassis_yaw)
+        new_world_pan = chassis_yaw_deg + actual_pan + PAN_SIGN * pan_err_deg
         new_world_tilt = actual_tilt + TILT_SIGN * tilt_err_deg
         now_bts = time.time()
         if target_world_pan_deg is not None and last_bearing_ts > 0:
