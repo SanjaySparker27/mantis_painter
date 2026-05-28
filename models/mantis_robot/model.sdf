@@ -18,23 +18,26 @@
         <geometry><mesh><uri>meshes/base_link.stl</uri></mesh></geometry>
         <material><ambient>0.18 0.20 0.22 1</ambient><diffuse>0.26 0.29 0.32 1</diffuse></material>
       </visual>
+      <!-- Wheels centered around the pan_link mount (2.26, -2.23) so the
+           camera arm sits over the geometric centre of the vehicle, not
+           offset to the right. Wheelbase 8.2 m, track 8.3 m. -->
       <visual name="wheel_fl">
-        <pose>5.0 1.8 -0.05 0 1.5708 0</pose>
+        <pose>6.36 1.92 -0.05 0 1.5708 0</pose>
         <geometry><cylinder><radius>0.6</radius><length>0.4</length></cylinder></geometry>
         <material><ambient>0.06 0.06 0.06 1</ambient><diffuse>0.10 0.10 0.10 1</diffuse></material>
       </visual>
       <visual name="wheel_fr">
-        <pose>5.0 -6.5 -0.05 0 1.5708 0</pose>
+        <pose>6.36 -6.38 -0.05 0 1.5708 0</pose>
         <geometry><cylinder><radius>0.6</radius><length>0.4</length></cylinder></geometry>
         <material><ambient>0.06 0.06 0.06 1</ambient><diffuse>0.10 0.10 0.10 1</diffuse></material>
       </visual>
       <visual name="wheel_rl">
-        <pose>-3.2 1.8 -0.05 0 1.5708 0</pose>
+        <pose>-1.84 1.92 -0.05 0 1.5708 0</pose>
         <geometry><cylinder><radius>0.6</radius><length>0.4</length></cylinder></geometry>
         <material><ambient>0.06 0.06 0.06 1</ambient><diffuse>0.10 0.10 0.10 1</diffuse></material>
       </visual>
       <visual name="wheel_rr">
-        <pose>-3.2 -6.5 -0.05 0 1.5708 0</pose>
+        <pose>-1.84 -6.38 -0.05 0 1.5708 0</pose>
         <geometry><cylinder><radius>0.6</radius><length>0.4</length></cylinder></geometry>
         <material><ambient>0.06 0.06 0.06 1</ambient><diffuse>0.10 0.10 0.10 1</diffuse></material>
       </visual>
