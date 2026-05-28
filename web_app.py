@@ -1533,14 +1533,19 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
         tilt_deg = clamp(tilt_deg + lpf * tilt_step_raw,
                          TILT_LIMIT[0], TILT_LIMIT[1])
 
-    # Velocity feed-forward: each tick, subtract the chassis yaw rate
-    # (in deg/frame) directly from pan_deg. Bypasses LPF + step clamps
-    # for instant response. The PID + world-bearing override handle
-    # residual error; this FF kills the basic chassis-rotation-drift
-    # without waiting for image feedback.
-    YAW_FF_CALIB = 0.8
-    yaw_ff_deg = (math.degrees(mantis_drive_vyaw + mantis_auto_yaw_rate)
+    # Velocity feed-forward with light LPF + step clamp. The LPF
+    # (_yaw_ff_lpf_vyaw) smooths abrupt vyaw reversals so the FF can't
+    # snap pan_deg past where the PID will pull it back. Clamp to
+    # pan_max_step caps the per-frame contribution at the joint's rate
+    # limit.
+    global _yaw_ff_lpf_vyaw
+    target_eff_vyaw = mantis_drive_vyaw + mantis_auto_yaw_rate
+    alpha_vff = 0.30  # ~3-frame time constant at 30 fps
+    _yaw_ff_lpf_vyaw = (1 - alpha_vff) * _yaw_ff_lpf_vyaw + alpha_vff * target_eff_vyaw
+    YAW_FF_CALIB = 1.0
+    yaw_ff_deg = (math.degrees(_yaw_ff_lpf_vyaw)
                   * dt * PAN_SIGN * YAW_FF_CALIB)
+    yaw_ff_deg = clamp(yaw_ff_deg, -pan_max_step, pan_max_step)
     pan_deg = clamp(pan_deg + yaw_ff_deg, PAN_LIMIT[0], PAN_LIMIT[1])
 
     publish_pan_tilt()
@@ -1899,6 +1904,7 @@ mantis_drive_speed: float = 4.0  # active speed setpoint used by V-key drive
 # of travel, so the nose can return toward neutral and keep tracking the
 # locked target. Active whenever a target is locked.
 mantis_auto_yaw_rate: float = 0.0
+_yaw_ff_lpf_vyaw: float = 0.0  # LPF-smoothed vyaw used by the controller for FF
 PAN_FOLLOW_THRESHOLD_DEG = 55.0   # start yawing the chassis past this pan
 PAN_FOLLOW_GAIN = 2.5             # rad/s at full pan saturation
 BUS_SPEED_M_S = 12.0      # peak depth velocity (front-back from mantis perspective)
