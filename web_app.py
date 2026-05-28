@@ -1470,14 +1470,37 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     # bandwidth (default 100 deg/s after the api_gains reset bump).
     pan_max_step = pan_gains.max_rate_deg_s * dt * zoom_scale
     tilt_max_step = tilt_gains.max_rate_deg_s * dt * zoom_scale
+    # World-bearing override: when the bbox is a ghost (lock-down or
+    # detection gap) PID error is zero, so pan would freeze even while
+    # the chassis keeps rotating. Use the stored target_world_pan_deg to
+    # compute where pan SHOULD be in chassis frame and aim for that.
+    # Hackaday-style PID handles the case where the base is static; our
+    # mantis vehicle moves, so we need this geometric compensation.
+    if (target is not None and target.score == 0
+            and target_world_pan_deg is not None):
+        chassis_yaw_deg_now = math.degrees(mantis_chassis_yaw)
+        desired_pan = clamp(target_world_pan_deg - chassis_yaw_deg_now,
+                            PAN_LIMIT[0], PAN_LIMIT[1])
     pan_step_raw = clamp(desired_pan - pan_deg, -pan_max_step, pan_max_step)
     tilt_step_raw = clamp(desired_tilt - tilt_deg, -tilt_max_step, tilt_max_step)
     lpf = 0.32 / max(1.0, math.sqrt(zoom_factor))
 
-    if in_deadband_x:
+    # Skip the deadband-blend when the world-bearing override is active
+    # (ghost target). The override desired_pan is the authoritative
+    # target for pan_deg in that case; the actual_pan blend would drag
+    # pan_cmd backward and cancel the world-bearing pursuit. Also bypass
+    # the LPF in override mode so the full max_rate (100 deg/s) is
+    # available to chase the chassis instead of being throttled to
+    # lpf * max_rate (~32 deg/s).
+    using_world_override = (target is not None and target.score == 0
+                            and target_world_pan_deg is not None)
+    if in_deadband_x and not using_world_override:
         pan_deg = clamp(0.85 * pan_deg + 0.15 * actual_pan,
                         PAN_LIMIT[0], PAN_LIMIT[1])
         pan_i_deg *= 0.80
+    elif using_world_override:
+        pan_deg = clamp(pan_deg + pan_step_raw,
+                        PAN_LIMIT[0], PAN_LIMIT[1])
     else:
         pan_deg = clamp(pan_deg + lpf * pan_step_raw,
                         PAN_LIMIT[0], PAN_LIMIT[1])
