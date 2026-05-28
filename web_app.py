@@ -1471,16 +1471,25 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     pan_max_step = pan_gains.max_rate_deg_s * dt * zoom_scale
     tilt_max_step = tilt_gains.max_rate_deg_s * dt * zoom_scale
     # World-bearing override: when the bbox is a ghost (lock-down or
-    # detection gap) PID error is zero, so pan would freeze even while
-    # the chassis keeps rotating. Use the stored target_world_pan_deg to
-    # compute where pan SHOULD be in chassis frame and aim for that.
-    # Hackaday-style PID handles the case where the base is static; our
-    # mantis vehicle moves, so we need this geometric compensation.
+    # detection gap) PID error is zero, so pan/tilt would freeze even
+    # while the chassis keeps rotating. Use the stored
+    # target_world_pan_deg + target_world_tilt_deg to compute where
+    # pan/tilt SHOULD be in chassis frame and aim for that. Hackaday
+    # turret has a static base so this never matters; the mantis
+    # vehicle moves, so we need this geometric compensation.
     if (target is not None and target.score == 0
             and target_world_pan_deg is not None):
         chassis_yaw_deg_now = math.degrees(mantis_chassis_yaw)
         desired_pan = clamp(target_world_pan_deg - chassis_yaw_deg_now,
                             PAN_LIMIT[0], PAN_LIMIT[1])
+    if (target is not None and target.score == 0
+            and target_world_tilt_deg is not None):
+        # Chassis is yaw-only (we don't model roll/pitch), so the world
+        # tilt to the target is unchanged. Hold the joint at the stored
+        # value so the nose doesn't pitch down while the lock is in
+        # ghost mode.
+        desired_tilt = clamp(target_world_tilt_deg,
+                             TILT_LIMIT[0], TILT_LIMIT[1])
     pan_step_raw = clamp(desired_pan - pan_deg, -pan_max_step, pan_max_step)
     tilt_step_raw = clamp(desired_tilt - tilt_deg, -tilt_max_step, tilt_max_step)
     lpf = 0.32 / max(1.0, math.sqrt(zoom_factor))
@@ -1504,10 +1513,13 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     else:
         pan_deg = clamp(pan_deg + lpf * pan_step_raw,
                         PAN_LIMIT[0], PAN_LIMIT[1])
-    if in_deadband_y:
+    if in_deadband_y and not using_world_override:
         tilt_deg = clamp(0.85 * tilt_deg + 0.15 * actual_tilt,
                          TILT_LIMIT[0], TILT_LIMIT[1])
         tilt_i_deg *= 0.80
+    elif using_world_override:
+        tilt_deg = clamp(tilt_deg + tilt_step_raw,
+                         TILT_LIMIT[0], TILT_LIMIT[1])
     else:
         tilt_deg = clamp(tilt_deg + lpf * tilt_step_raw,
                          TILT_LIMIT[0], TILT_LIMIT[1])
