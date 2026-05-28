@@ -199,71 +199,114 @@
       </plugin>
     </model>
 
-    <!-- Encircling props: 12 objects on a 15 m ring around mantis (0,-8).
-         Positions are pre-computed as (15*sin(θ), -8 + 15*cos(θ)) so
-         θ=0° is north of mantis, θ=90° east, θ=180° south, θ=270° west.
-         Variety: 3 houses + cones + barrel + buses + mailbox + hydrant +
-         trash bin so the tracker sees mixed YOLO classes. -->
-    <!-- Ring radius is 30 m from mantis at (0,-8). Positions are
-         (30*sin(θ), -8 + 30*cos(θ)) for θ stepping 30° from north. -->
+    <!-- Encircling props: vehicle-heavy 50 m ring around mantis (0,-8).
+         Positions are (50*sin(θ), -8 + 50*cos(θ)) for θ stepping 30° from
+         north. Houses removed per request. Mostly cars + trucks + cones /
+         barrel / inline bus / inline custom truck for diversity. -->
     <include>
-      <name>ring_house_1</name>
-      <pose>0.00 22.00 0 0 0 3.14</pose>
-      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/House 1</uri>
+      <name>ring_pickup_north</name>
+      <pose>0.00 60.00 0 0 0 0</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/pickup</uri>
     </include>
     <include>
-      <name>ring_cone_a</name>
-      <pose>15.00 18.00 0 0 0 0</pose>
+      <name>ring_prius_30</name>
+      <pose>25.00 35.30 0 0 0 -0.665</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/prius hybrid</uri>
+    </include>
+    <include>
+      <name>ring_pickup_60</name>
+      <pose>43.30 17.00 0 0 0 -1.31</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/pickup</uri>
+    </include>
+    <!-- Inline bus-shaped box. Placed due north of mantis (0,-8) at (0,42)
+         (50 m radius) so depth axis lines up with pan=0. -->
+    <model name="ring_bus_a">
+      <pose>0.0 42.0 1.6 0 0 1.5708</pose>
+      <link name="link">
+        <inertial>
+          <mass>80</mass>
+          <inertia>
+            <ixx>200</ixx><iyy>800</iyy><izz>850</izz>
+            <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+          </inertia>
+        </inertial>
+        <gravity>false</gravity>
+        <visual name="body">
+          <geometry><box><size>11 2.6 3.0</size></box></geometry>
+          <material>
+            <ambient>0.85 0.15 0.15 1</ambient>
+            <diffuse>0.92 0.18 0.18 1</diffuse>
+          </material>
+        </visual>
+        <visual name="window_strip">
+          <pose>0 0 0.55 0 0 0</pose>
+          <geometry><box><size>9 2.62 0.6</size></box></geometry>
+          <material>
+            <ambient>0.10 0.10 0.18 1</ambient>
+            <diffuse>0.12 0.12 0.22 1</diffuse>
+          </material>
+        </visual>
+      </link>
+      <plugin filename="gz-sim-velocity-control-system" name="gz::sim::systems::VelocityControl">
+        <topic>ring_bus_a/cmd_vel</topic>
+      </plugin>
+    </model>
+    <include>
+      <name>ring_prius_90</name>
+      <pose>50.00 -8.00 0 0 0 -1.5708</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/prius hybrid</uri>
+    </include>
+    <include>
+      <name>ring_pickup_120</name>
+      <pose>43.30 -33.00 0 0 0 -2.094</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/pickup</uri>
+    </include>
+    <include>
+      <name>ring_cone_150</name>
+      <pose>25.00 -51.30 0 0 0 0</pose>
       <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/Construction Cone</uri>
     </include>
+    <!-- Inline truck-shaped box at the southern point so YOLO has a non-COCO
+         primitive to confuse it. Bright cyan body. -->
+    <model name="ring_truck_south">
+      <pose>0.0 -58.0 1.5 0 0 0</pose>
+      <link name="link">
+        <inertial><mass>50</mass><inertia><ixx>50</ixx><iyy>200</iyy><izz>220</izz></inertia></inertial>
+        <gravity>false</gravity>
+        <visual name="body">
+          <geometry><box><size>7 2.4 2.6</size></box></geometry>
+          <material><ambient>0.12 0.55 0.62 1</ambient><diffuse>0.16 0.72 0.80 1</diffuse></material>
+        </visual>
+        <visual name="cab">
+          <pose>2.4 0 0.4 0 0 0</pose>
+          <geometry><box><size>2.2 2.4 1.8</size></box></geometry>
+          <material><ambient>0.10 0.30 0.40 1</ambient><diffuse>0.14 0.40 0.50 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
     <include>
-      <name>ring_barrel_a</name>
-      <pose>25.98 7.00 0 0 0 0</pose>
+      <name>ring_pickup_210</name>
+      <pose>-25.00 -51.30 0 0 0 2.094</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/pickup</uri>
+    </include>
+    <include>
+      <name>ring_barrel_240</name>
+      <pose>-43.30 -33.00 0 0 0 0</pose>
       <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/Construction Barrel</uri>
     </include>
     <include>
-      <name>ring_bus_a</name>
-      <pose>30.00 -8.00 0 0 0 1.5708</pose>
-      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/Bus</uri>
+      <name>ring_prius_270</name>
+      <pose>-50.00 -8.00 0 0 0 1.5708</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/prius hybrid</uri>
     </include>
     <include>
-      <name>ring_house_2</name>
-      <pose>25.98 -23.00 0 0 0 0</pose>
-      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/House 2</uri>
+      <name>ring_pickup_300</name>
+      <pose>-43.30 17.00 0 0 0 1.31</pose>
+      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/pickup</uri>
     </include>
     <include>
-      <name>ring_mailbox_a</name>
-      <pose>15.00 -33.98 0 0 0 0</pose>
-      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/MailBox</uri>
-    </include>
-    <include>
-      <name>ring_house_3</name>
-      <pose>0.00 -38.00 0 0 0 0</pose>
-      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/House 3</uri>
-    </include>
-    <include>
-      <name>ring_hydrant_a</name>
-      <pose>-15.00 -33.98 0 0 0 0</pose>
-      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/Fire Hydrant</uri>
-    </include>
-    <include>
-      <name>ring_pine_a</name>
-      <pose>-25.98 -23.00 0 0 0 0</pose>
-      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/Pine Tree</uri>
-    </include>
-    <include>
-      <name>ring_cabinet_a</name>
-      <pose>-30.00 -8.00 0 0 0 0</pose>
-      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/Cabinet</uri>
-    </include>
-    <include>
-      <name>ring_cone_b</name>
-      <pose>-25.98 7.00 0 0 0 0</pose>
-      <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/Construction Cone</uri>
-    </include>
-    <include>
-      <name>ring_person_a</name>
-      <pose>-15.00 18.00 0 0 0 0</pose>
+      <name>ring_person_330</name>
+      <pose>-25.00 35.30 0 0 0 0</pose>
       <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/Standing person</uri>
     </include>
 

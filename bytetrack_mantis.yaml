@@ -1,0 +1,26 @@
+# ByteTrack config tuned for Mantis: longer occlusion buffer + lower
+# new-track threshold so a target that disappears behind a building
+# and reappears keeps its original ID.
+
+tracker_type: bytetrack
+
+# First-stage match: lowered from 0.25 so a re-emerging track with a weak
+# initial detection still associates with its old ID.
+track_high_thresh: 0.20
+
+# Second-stage matching threshold for low-score detections.
+track_low_thresh: 0.08
+
+# Start a new track only if no plausible match. Higher than default keeps
+# IDs sticky when target briefly disappears.
+new_track_thresh: 0.30
+
+# Frames to keep lost tracks alive — bumped from 30 (~1 s @30 fps) to 150
+# (~5 s) so a brief occlusion doesn't burn the ID. Ultralytics scales by
+# detection interval so behaviour is roughly equivalent to wall-clock.
+track_buffer: 150
+
+# Association similarity threshold (IoU/cost). Slightly relaxed from 0.8.
+match_thresh: 0.85
+
+fuse_score: True

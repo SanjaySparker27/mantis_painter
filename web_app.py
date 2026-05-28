@@ -121,6 +121,7 @@ car_prius_pub = node.advertise("/car_prius_front/cmd_vel", Twist)
 car_pickup_pub = node.advertise("/car_pickup_right/cmd_vel", Twist)
 ball_red_pub = node.advertise("/ball_red/cmd_vel", Twist)
 ball_green_pub = node.advertise("/ball_green/cmd_vel", Twist)
+ring_bus_pub = node.advertise("/ring_bus_a/cmd_vel", Twist)
 
 latest_raw: np.ndarray | None = None
 latest_annotated: bytes | None = None
@@ -146,7 +147,8 @@ last_target_seen_ts = 0.0
 smoothed_cx = 0.0
 smoothed_cy = 0.0
 smoothed_init = False
-selected_signature: np.ndarray | None = None   # HSV histogram of the selected bbox
+selected_signature: np.ndarray | None = None   # HSV histogram of the selected bbox (EMA-refreshed)
+selected_signature_anchor: np.ndarray | None = None  # immutable snapshot captured at /api/select — used as fallback when EMA-blended signature has drifted away from the original target
 _resolve_via_same_id: bool = False   # set True only when resolver returned via pre-flight same_id branch
 # Pass 1 tightening thresholds (Fix A)
 PASS1_SIG_MAX = 0.35       # Bhattacharyya cap (was 0.45)
@@ -157,7 +159,7 @@ NEW_ID_CONFIRM_FRAMES = 3  # require this many consecutive resolver hits on a ne
 _pending_new_id: int | None = None
 _pending_new_id_streak: int = 0
 # Long-lost re-acquire tightening (Fix D)
-LONGLOST_SIG_MAX = 0.30    # only re-bind via long-lost path if signature distance under this
+LONGLOST_SIG_MAX = 0.38    # re-bind via long-lost path when sig distance under this (loosened so occluded target re-emerging with slight lighting change still matches)
 # Auto-zoom (auto-mode): keep the locked target's bbox area inside a band.
 auto_zoom_enabled: bool = False
 AUTO_ZOOM_LOW = 0.012      # bbox area / frame area below this -> zoom in
@@ -234,7 +236,7 @@ PURSUIT_DECAY_S = 1.8    # bearing-velocity decay constant during loss
 PURSUIT_MAX_S = 4.0      # stop extrapolating after this long
 last_target_w = 60.0
 last_target_h = 60.0
-PERSIST_HORIZON_S = 3.0  # forward-fill detection up to this long after a miss
+PERSIST_HORIZON_S = 6.0  # forward-fill detection up to this long after a miss (longer = survives bigger occlusions)
 LONG_LOST_REACQUIRE_S = 120.0  # try same-name re-acquisition for this long
 pan_i_deg = 0.0
 tilt_i_deg = 0.0
@@ -321,7 +323,7 @@ YOLO_WEIGHTS_TRY = [
     "yolov8n.pt",
 ]
 _yolo_model = None
-_yolo_tracker_cfg = "bytetrack.yaml"
+_yolo_tracker_cfg = "bytetrack_mantis.yaml"  # tuned for Mantis occlusion recovery
 _yolo_class_palette = {}
 _yoloworld_model = None
 _yoloworld_classes: list[str] = ["car", "person", "truck", "drone"]
@@ -661,6 +663,8 @@ def clear_selection() -> None:
     selected_name = None
     selected_anchor_xy = None
     selected_signature = None
+    global selected_signature_anchor
+    selected_signature_anchor = None
     smoothed_init = False
     target_vx_pix_s = 0.0
     target_vy_pix_s = 0.0
@@ -769,6 +773,17 @@ def _confirm_new_id(cand: "Detection") -> "Detection | None":
     # the visible [LOCKED] box to shift mid-paint. Lock down hard: return
     # ghost until centering completes or the watchdog kills it.
     if sweep_enabled and sweep_center_hold_start_ts > 0:
+        g = _ghost_target()
+        return g if g is not None else cand
+    # Ego-motion lock-down: while the chassis is driving or auto-swaying,
+    # target bearing changes faster than the Kalman process noise can
+    # explain, so Pass 1/2/3 are more likely to bind onto a sibling that
+    # happens to fall near the predicted bbox. Hold the original lock by
+    # returning ghost instead of rebinding to a new det_id.
+    if (mantis_moving
+        or abs(mantis_drive_vx) > 0.1
+        or abs(mantis_drive_vy) > 0.1
+        or abs(mantis_drive_vyaw) > 0.05):
         g = _ghost_target()
         return g if g is not None else cand
     # Count any frame where the resolver wants to rebind, even if YOLO is
@@ -989,14 +1004,23 @@ def resolve_selected_target() -> Detection | None:
                 # target.
                 same_name_any = [d for d in strong
                                  if d.name == selected_name and _bbox_size_similar(d)]
-                if same_name_any and selected_signature is not None:
-                    same_name_any.sort(key=lambda d: _signature_distance(
-                        selected_signature,
-                        _hsv_signature_from_bbox(latest_raw, d.bbox)))
+                # Score against BOTH the EMA-blended live signature AND the
+                # immutable lock-time anchor. Take whichever is closer — if
+                # the live signature drifted while we were on a sibling
+                # transiently, the anchor catches the original target when
+                # it re-emerges from occlusion.
+                def _best_sig_dist(d):
+                    cand = _hsv_signature_from_bbox(latest_raw, d.bbox)
+                    a = _signature_distance(selected_signature, cand) \
+                        if selected_signature is not None else 1.0
+                    b = _signature_distance(selected_signature_anchor, cand) \
+                        if selected_signature_anchor is not None else 1.0
+                    return min(a, b)
+                if same_name_any and (selected_signature is not None
+                                      or selected_signature_anchor is not None):
+                    same_name_any.sort(key=_best_sig_dist)
                     best = same_name_any[0]
-                    best_sig = _signature_distance(
-                        selected_signature,
-                        _hsv_signature_from_bbox(latest_raw, best.bbox))
+                    best_sig = _best_sig_dist(best)
                     if best_sig < LONGLOST_SIG_MAX:
                         return _confirm_new_id(best)
         return None
@@ -1222,18 +1246,34 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
             last_target_w = 0.85 * last_target_w + 0.15 * new_w
             last_target_h = 0.85 * last_target_h + 0.15 * new_h
 
-    # Exponential filter on bbox center to remove detector micro-jitter
+    # Exponential filter on bbox center to remove detector micro-jitter.
+    # Higher beta + KF-driven motion between detections so the controller
+    # never sits idle waiting for the next YOLO frame.
     global smoothed_cx, smoothed_cy, smoothed_init
     if not smoothed_init:
         smoothed_cx = cx_raw
         smoothed_cy = cy_raw
         smoothed_init = True
     else:
-        beta = 0.20
+        # 0.20 was too sluggish — caused 50–80 ms latency before pan/tilt
+        # saw the new bbox. 0.45 keeps mild jitter rejection but lets the
+        # controller respond on the next frame.
+        beta = 0.45
         smoothed_cx = (1 - beta) * smoothed_cx + beta * cx_raw
         smoothed_cy = (1 - beta) * smoothed_cy + beta * cy_raw
     cx = smoothed_cx
     cy = smoothed_cy
+    # Between detections (camera 30 fps vs YOLO ~12 fps) the smoothed
+    # center sits still, so pan/tilt arrives at desired_pan and stalls
+    # until the next detection. Project the bbox forward in pixel-space
+    # using the EMA velocity so the controller has fresh error to chase
+    # every control tick — gives stepper-free continuous slewing.
+    if (last_target_seen_ts > 0
+            and (now - last_target_seen_ts) < 0.3
+            and (abs(target_vx_pix_s) > 5.0 or abs(target_vy_pix_s) > 5.0)):
+        stale = now - last_target_seen_ts
+        cx = cx + target_vx_pix_s * stale
+        cy = cy + target_vy_pix_s * stale
 
     if last_target_seen_ts > 0:
         gap = max(1e-3, now - last_target_seen_ts)
@@ -1293,15 +1333,25 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     last_ex_norm = nx
     last_ey_norm = ny
 
-    PID_OUT_CLAMP_DEG = 6.0
+    # Ego-motion boost: when the chassis is moving, scale Kp + per-frame
+    # output clamp so the nose chases the apparent target shift instantly.
+    # Default boost = 1.0 (no change). At 1.8 the pan/tilt response on a
+    # 4 m/s vehicle catches the target before bbox drifts more than ~5%
+    # off center.
+    ego_active = (mantis_moving
+                  or abs(mantis_drive_vx) > 0.1
+                  or abs(mantis_drive_vy) > 0.1
+                  or abs(mantis_drive_vyaw) > 0.05)
+    ego_boost = 2.6 if ego_active else 1.0
+    PID_OUT_CLAMP_DEG = 18.0 if ego_active else 6.0
     pan_u_deg = clamp(
-        pan_gains.kp * pan_err_deg
+        ego_boost * pan_gains.kp * pan_err_deg
         + pan_gains.ki * pan_i_deg
         + pan_gains.kd * pan_derr_per_s,
         -PID_OUT_CLAMP_DEG, PID_OUT_CLAMP_DEG,
     )
     tilt_u_deg = clamp(
-        tilt_gains.kp * tilt_err_deg
+        ego_boost * tilt_gains.kp * tilt_err_deg
         + tilt_gains.ki * tilt_i_deg
         + tilt_gains.kd * tilt_derr_per_s,
         -PID_OUT_CLAMP_DEG, PID_OUT_CLAMP_DEG,
@@ -1344,11 +1394,24 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     # Aggressive rate scaling: pixel-per-degree grows with zoom, so any
     # over-correction looks proportionally larger. Scale max slew by 1/z^1.4.
     zoom_scale = 1.0 / (max(1.0, zoom_factor) ** 1.4)
-    pan_max_step = pan_gains.max_rate_deg_s * dt * zoom_scale
-    tilt_max_step = tilt_gains.max_rate_deg_s * dt * zoom_scale
-    pan_step_raw = clamp(desired_pan - pan_deg, -pan_max_step, pan_max_step)
+    # Ego boost also widens the per-step rate cap + sharpens the LPF so the
+    # joint can actually deliver the higher PID output. Joint hardware
+    # limits are pan 2.5 rad/s (143 deg/s), tilt 2.0 rad/s (114 deg/s) —
+    # well above the boosted gains so the actuator isn't the bottleneck.
+    rate_boost = 2.5 if ego_active else 1.0
+    pan_max_step = pan_gains.max_rate_deg_s * dt * zoom_scale * rate_boost
+    tilt_max_step = tilt_gains.max_rate_deg_s * dt * zoom_scale * rate_boost
+    # Feed-forward: chassis yaw rotates the camera in world frame. Subtract
+    # it from the pan command directly so the nose stays glued to the
+    # world-frame bearing without waiting for the feedback loop to detect
+    # the bbox shift. dyaw is in rad/s; convert to deg/s and to per-frame
+    # step. Sign flipped to match camera convention.
+    yaw_ff_deg = -math.degrees(mantis_drive_vyaw) * dt
+    desired_pan_ff = desired_pan + yaw_ff_deg
+    pan_step_raw = clamp(desired_pan_ff - pan_deg, -pan_max_step, pan_max_step)
     tilt_step_raw = clamp(desired_tilt - tilt_deg, -tilt_max_step, tilt_max_step)
-    lpf = 0.32 / max(1.0, math.sqrt(zoom_factor))  # softer LPF when zoomed
+    base_lpf = 0.32 / max(1.0, math.sqrt(zoom_factor))
+    lpf = min(0.7, base_lpf * 1.8) if ego_active else base_lpf
 
     # Inside deadband: freeze command at actual joint position and decay
     # integral fast so we don't accumulate noise into the next motion.
@@ -1702,6 +1765,134 @@ def on_joint_state(msg: Model) -> None:
 target_moving = False
 cars_moving = False
 people_walking = False
+bus_moving = False
+mantis_moving = False
+MANTIS_SWAY_AMP = 4.0    # meters: peak +/- displacement from spawn
+MANTIS_SWAY_PERIOD_S = 6.0
+# Live mantis chassis pose for V-key drive. Integrated continuously by
+# _mantis_drive_loop using mantis_drive_v* (m/s, rad/s).
+mantis_chassis_x: float = 0.0
+mantis_chassis_y: float = -8.0
+mantis_chassis_yaw: float = 0.0
+mantis_drive_vx: float = 0.0
+mantis_drive_vy: float = 0.0
+mantis_drive_vyaw: float = 0.0
+MANTIS_DRIVE_MAX_SPEED = 25.0  # m/s clamp (high-speed mode caps)
+MANTIS_DRIVE_MAX_YAW = 3.0     # rad/s clamp
+mantis_drive_speed: float = 4.0  # active speed setpoint used by V-key drive
+BUS_SPEED_M_S = 4.0       # peak depth velocity (front-back from mantis perspective)
+BUS_PERIOD_S = 3.0        # full forward+reverse cycle
+
+
+def _bus_loop():
+    """Drives ring_bus_a back and forth by teleporting via the gz set_pose
+    service. VelocityControl was flaky on this rigid inline model — pose
+    teleport guarantees clean depth motion at any speed."""
+    import math as _m
+    import subprocess as _sp
+    # Bus spawn at (18, 6, 1.6) yaw=0.665 rad. Body-x direction in world is
+    # (cos(yaw), sin(yaw)) = (0.787, 0.617). Oscillate along that vector.
+    BX, BY, BZ, YAW = 0.0, 42.0, 1.6, 1.5708
+    # Body-x at yaw=pi/2 points along world +y → depth axis from mantis at (0,-8).
+    dirx, diry = _m.cos(YAW), _m.sin(YAW)
+    t0 = time.time()
+    while True:
+        if bus_moving:
+            # Triangle wave: amplitude = BUS_SPEED * PERIOD/4. Linear back+forth.
+            phase = ((time.time() - t0) % BUS_PERIOD_S) / BUS_PERIOD_S  # 0..1
+            if phase < 0.5:
+                travel = (phase * 4 - 1) * BUS_SPEED_M_S * BUS_PERIOD_S / 4
+            else:
+                travel = (3 - phase * 4) * BUS_SPEED_M_S * BUS_PERIOD_S / 4
+            x = BX + dirx * travel
+            y = BY + diry * travel
+            req = (f'name: "ring_bus_a" '
+                   f'position {{ x: {x:.3f} y: {y:.3f} z: {BZ:.3f} }} '
+                   f'orientation {{ z: {_m.sin(YAW/2):.4f} w: {_m.cos(YAW/2):.4f} }}')
+            try:
+                _sp.run(
+                    ["gz", "service", "-s", "/world/mantis_robot_world/set_pose",
+                     "--reqtype", "gz.msgs.Pose", "--reptype", "gz.msgs.Boolean",
+                     "--timeout", "200", "--req", req],
+                    capture_output=True, timeout=1.0, check=False,
+                )
+            except Exception:
+                pass
+        time.sleep(0.05)
+
+
+threading.Thread(target=_bus_loop, daemon=True).start()
+
+
+def _mantis_motion_loop():
+    """Ego-motion: teleport the mantis chassis along world +x to simulate a
+    moving turret (vehicle, gimbal on a rover, ...). The tracker has to
+    cope with both target motion AND camera-frame motion."""
+    import math as _m, subprocess as _sp
+    SPAWN_X, SPAWN_Y, SPAWN_Z = 0.0, -8.0, 0.0
+    t0 = time.time()
+    while True:
+        if mantis_moving:
+            phase = ((time.time() - t0) % MANTIS_SWAY_PERIOD_S) / MANTIS_SWAY_PERIOD_S
+            # triangle wave on +/- amplitude
+            if phase < 0.5:
+                travel = (phase * 4 - 1) * MANTIS_SWAY_AMP
+            else:
+                travel = (3 - phase * 4) * MANTIS_SWAY_AMP
+            x = SPAWN_X + travel
+            req = (f'name: "mantis_robot" '
+                   f'position {{ x: {x:.3f} y: {SPAWN_Y:.3f} z: {SPAWN_Z:.3f} }} '
+                   f'orientation {{ w: 1.0 }}')
+            try:
+                _sp.run(
+                    ["gz", "service", "-s", "/world/mantis_robot_world/set_pose",
+                     "--reqtype", "gz.msgs.Pose", "--reptype", "gz.msgs.Boolean",
+                     "--timeout", "200", "--req", req],
+                    capture_output=True, timeout=1.0, check=False,
+                )
+            except Exception:
+                pass
+        time.sleep(0.05)
+
+
+threading.Thread(target=_mantis_motion_loop, daemon=True).start()
+
+
+def _mantis_drive_loop():
+    """30 Hz integrator that turns velocity setpoints into smooth chassis
+    motion. JS keydown writes mantis_drive_v*; keyup zeros them; this loop
+    advances pose and teleports via gz set_pose. Gives car-like continuous
+    motion instead of per-keypress jumps."""
+    import math as _m, subprocess as _sp
+    global mantis_chassis_x, mantis_chassis_y, mantis_chassis_yaw
+    dt = 1.0 / 30.0
+    while True:
+        if abs(mantis_drive_vx) > 1e-3 or abs(mantis_drive_vy) > 1e-3 \
+                or abs(mantis_drive_vyaw) > 1e-3:
+            # vx is FORWARD (body x), vy is LEFT (body y). Rotate into world.
+            yaw = mantis_chassis_yaw
+            wx = mantis_drive_vx * _m.cos(yaw) - mantis_drive_vy * _m.sin(yaw)
+            wy = mantis_drive_vx * _m.sin(yaw) + mantis_drive_vy * _m.cos(yaw)
+            mantis_chassis_x += wx * dt
+            mantis_chassis_y += wy * dt
+            mantis_chassis_yaw += mantis_drive_vyaw * dt
+            req = (f'name: "mantis_robot" '
+                   f'position {{ x: {mantis_chassis_x:.3f} y: {mantis_chassis_y:.3f} z: 0.0 }} '
+                   f'orientation {{ z: {_m.sin(mantis_chassis_yaw/2):.4f} '
+                   f'w: {_m.cos(mantis_chassis_yaw/2):.4f} }}')
+            try:
+                _sp.run(
+                    ["gz", "service", "-s", "/world/mantis_robot_world/set_pose",
+                     "--reqtype", "gz.msgs.Pose", "--reptype", "gz.msgs.Boolean",
+                     "--timeout", "100", "--req", req],
+                    capture_output=True, timeout=0.3, check=False,
+                )
+            except Exception:
+                pass
+        time.sleep(dt)
+
+
+threading.Thread(target=_mantis_drive_loop, daemon=True).start()
 
 
 def _moving_target_loop():
@@ -1886,6 +2077,7 @@ HTML_PAGE = r"""
           <div class="hd">Shortcuts</div>
           <div><b>L</b> lock center · <b>C</b> clear · <b>A</b> auto · <b>S</b> stop · <b>H</b> home</div>
           <div><b>K</b> keyboard on/off · <b>Shift+&uarr;/&darr;</b> zoom · <b>Esc</b> stop · <b>P</b>/Space paint</div>
+          <div><b>M</b> drive nose (pan/tilt) · <b>V</b> drive chassis (front/back/left/right)</div>
           <div><b>Arrows</b> jog (Keyboard ON) · click image to select · <b>T</b> tracking</div>
         </div>
       </div>
@@ -1927,6 +2119,13 @@ HTML_PAGE = r"""
         <button id="bSweepReset" title="forget painted memory">Reset memory</button>
         <button id="bMoveTgt" title="bounce the yellow ball in place">Move ball: OFF</button>
         <button id="bMoveCars" title="drive the prius+pickup in circles in front of the mantis">Move cars: OFF</button>
+        <button id="bMoveBus" title="oscillate the inline red bus front/back along its body-x axis (north of mantis)">Move bus: OFF</button>
+        <button id="bMoveMantis" title="ego-motion test: teleport the whole mantis chassis along world +x; tracker must hold lock through camera motion">Move turret: OFF</button>
+        <label class="label" style="display:flex;align-items:center;gap:6px;margin-left:4px" title="V-key drive top speed (m/s). Affects both keyboard drive and the Move turret auto-sway amplitude.">
+          Drive
+          <input id="driveSpeed" type="range" min="1" max="25" step="0.5" value="4" style="width:120px;vertical-align:middle">
+          <span id="driveSpeedV" style="min-width:36px;text-align:right">4.0</span> m/s
+        </label>
         <button id="bWalkPpl" title="walk the two persons forward + slight turn">Walk people: OFF</button>
         <button id="bAutoZoom" title="auto-zoom in when locked target gets small, zoom out when it fills the frame">Auto Zoom: OFF</button>
         <button id="bKeyboard" title="enable keyboard control (K toggles). Arrows = jog. Space = PAINT. T = Tracking. C = Clear. H = Home. A = Auto. S = Stop. L = Lock center. Shift+Up/Down = Zoom. Esc = STOP.">Keyboard: OFF</button>
@@ -2064,6 +2263,24 @@ bWalkPpl.onclick=async ()=>{
   bWalkPpl.classList.toggle('active',walkPplOn);
   await fetch('/api/people_walking',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:walkPplOn})});
 };
+let busMovingOn=false;
+bMoveBus.onclick=async ()=>{
+  busMovingOn=!busMovingOn;
+  bMoveBus.textContent='Move bus: '+(busMovingOn?'ON':'OFF');
+  bMoveBus.classList.toggle('active',busMovingOn);
+  await fetch('/api/bus_moving',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:busMovingOn})});
+};
+let mantisMovingOn=false;
+bMoveMantis.onclick=async ()=>{
+  mantisMovingOn=!mantisMovingOn;
+  bMoveMantis.textContent='Move turret: '+(mantisMovingOn?'ON':'OFF');
+  bMoveMantis.classList.toggle('active',mantisMovingOn);
+  await fetch('/api/mantis_moving',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:mantisMovingOn})});
+};
+driveSpeed.addEventListener('input',()=>{
+  driveSpeedV.textContent=parseFloat(driveSpeed.value).toFixed(1);
+  fetch('/api/mantis_speed',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({speed:parseFloat(driveSpeed.value)})});
+});
 let autoZoomOn=false;
 bAutoZoom.onclick=async ()=>{
   autoZoomOn=!autoZoomOn;
@@ -2162,12 +2379,19 @@ function jog(dir){
 }
 document.querySelectorAll('[data-jog]').forEach(b=>b.onclick=()=>jog(b.dataset.jog));
 
-let keyboardOn=false;
+// Restore client-only flags from localStorage so a browser refresh keeps
+// the user's previous keyboard+drive choices.
+let keyboardOn=localStorage.getItem('mantis_keyboardOn')==='1';
+bKeyboard.textContent='Keyboard: '+(keyboardOn?'ON':'OFF');
+bKeyboard.classList.toggle('active',keyboardOn);
 bKeyboard.onclick=()=>{
   keyboardOn=!keyboardOn;
   bKeyboard.textContent='Keyboard: '+(keyboardOn?'ON':'OFF');
   bKeyboard.classList.toggle('active',keyboardOn);
+  localStorage.setItem('mantis_keyboardOn', keyboardOn?'1':'0');
 };
+window._driveMode = localStorage.getItem('mantis_driveMode') || 'mantis';
+if(window._driveMode==='vehicle') bConnect.style.borderColor='var(--amber)';
 function nudgeZoom(delta){
   const mn=parseFloat(zoomEl.min),mx=parseFloat(zoomEl.max);
   let v=parseFloat(zoomEl.value)+delta;
@@ -2191,6 +2415,15 @@ async function lockBestInView(){
   const t=scored[0];
   fetch('/api/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:t.cx,y:t.cy})});
 }
+document.addEventListener('keyup',e=>{
+  if(window._driveMode!=='vehicle') return;
+  const k=e.key.toLowerCase();
+  if(['arrowup','arrowdown','w'].includes(k)){
+    fetch('/api/mantis_drive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vx:0})});
+  } else if(['arrowleft','arrowright','d'].includes(k)){
+    fetch('/api/mantis_drive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vyaw:0})});
+  }
+});
 document.addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT'||e.target.tagName==='TEXTAREA') return;
   // Zoom + mode/lock shortcuts work without keyboard mode being toggled on.
@@ -2207,8 +2440,30 @@ document.addEventListener('keydown',e=>{
   if(k==='h'){ setMode('home'); return; }
   if(k==='l'){ lockBestInView(); return; }
   if(k==='k'){ bKeyboard.click(); return; }
+  if(k==='v'){ window._driveMode='vehicle'; localStorage.setItem('mantis_driveMode','vehicle'); bConnect.style.borderColor='var(--amber)'; console.log('keyboard drive: VEHICLE (front/back/left/right)'); return; }
+  if(k==='m'){ window._driveMode='mantis'; localStorage.setItem('mantis_driveMode','mantis'); bConnect.style.borderColor=''; console.log('keyboard drive: MANTIS (pan/tilt)'); return; }
   if(k==='escape'||k==='x'){ setMode('stop'); e.preventDefault(); return; }
   if(!keyboardOn) return;
+  if(window._driveMode==='vehicle'){
+    const SPEED=parseFloat(driveSpeed.value)||4.0;
+    const YAW_SPEED=Math.min(2.5, SPEED * 0.25);
+    // Press = start drive (velocity setpoint). Release handled by keyup.
+    if(e.repeat){ e.preventDefault(); return; }
+    let vx=null,vy=null,vyaw=null;
+    if(k==='arrowup'||k==='w') vx=+SPEED;
+    else if(k==='arrowdown') vx=-SPEED;
+    else if(k==='arrowleft') vyaw=+YAW_SPEED;
+    else if(k==='arrowright'||k==='d') vyaw=-YAW_SPEED;
+    if(vx!==null||vy!==null||vyaw!==null){
+      const body={};
+      if(vx!==null) body.vx=vx;
+      if(vy!==null) body.vy=vy;
+      if(vyaw!==null) body.vyaw=vyaw;
+      fetch('/api/mantis_drive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      e.preventDefault();
+      return;
+    }
+  }
   if(k==='arrowleft'){jog('pan-left');e.preventDefault();}
   else if(k==='arrowright'||k==='d'){jog('pan-right');e.preventDefault();}
   else if(k==='arrowup'||k==='w'){jog('tilt-up');e.preventDefault();}
@@ -2293,6 +2548,37 @@ async function poll(){
       const lbl = s.frame_source==='gz' ? 'Gazebo Sim' :
                   s.frame_source.startsWith('webcam:') ? ('Webcam #'+s.frame_source.split(':')[1]) : s.frame_source;
       bConnect.textContent='Connect: '+lbl;
+    }
+    // Sync the rest of the toggles + slider from server state so a browser
+    // refresh doesn't reset what the user already enabled.
+    if(s.cars_moving!==undefined){
+      moveCarsOn=!!s.cars_moving;
+      bMoveCars.textContent='Move cars: '+(moveCarsOn?'ON':'OFF');
+      bMoveCars.classList.toggle('active',moveCarsOn);
+    }
+    if(s.people_walking!==undefined){
+      walkPplOn=!!s.people_walking;
+      bWalkPpl.textContent='Walk people: '+(walkPplOn?'ON':'OFF');
+      bWalkPpl.classList.toggle('active',walkPplOn);
+    }
+    if(s.moving_target!==undefined){
+      moveTgtOn=!!s.moving_target;
+      bMoveTgt.textContent='Move ball: '+(moveTgtOn?'ON':'OFF');
+      bMoveTgt.classList.toggle('active',moveTgtOn);
+    }
+    if(s.bus_moving!==undefined){
+      busMovingOn=!!s.bus_moving;
+      bMoveBus.textContent='Move bus: '+(busMovingOn?'ON':'OFF');
+      bMoveBus.classList.toggle('active',busMovingOn);
+    }
+    if(s.mantis_moving!==undefined){
+      mantisMovingOn=!!s.mantis_moving;
+      bMoveMantis.textContent='Move turret: '+(mantisMovingOn?'ON':'OFF');
+      bMoveMantis.classList.toggle('active',mantisMovingOn);
+    }
+    if(s.mantis_drive_speed!==undefined && document.activeElement!==driveSpeed){
+      driveSpeed.value=s.mantis_drive_speed;
+      driveSpeedV.textContent=Number(s.mantis_drive_speed).toFixed(1);
     }
     detRows.innerHTML=s.detections.map(d=>`<tr><td><button onclick="selectDetection(${d.id})">${d.id}</button></td><td>${d.name}</td><td>${(d.score*100).toFixed(0)}%</td></tr>`).join('');
     marks.innerHTML=s.virtual_marks.slice(0,8).map(m=>`<tr><td>${m.target}</td><td>${m.pan_deg}</td><td>${m.tilt_deg}</td></tr>`).join('');
@@ -2468,6 +2754,12 @@ def api_status():
             "paint_auto": paint_auto,
             "sweep_enabled": sweep_enabled,
             "sweep_painted": sorted(sweep_painted_ids),
+            "cars_moving": cars_moving,
+            "people_walking": people_walking,
+            "moving_target": target_moving,
+            "bus_moving": bus_moving,
+            "mantis_moving": mantis_moving,
+            "mantis_drive_speed": mantis_drive_speed,
         })
 
 
@@ -2533,12 +2825,14 @@ def api_select():
         jog_pan_target = None
         jog_tilt_target = None
         x1, y1, x2, y2 = hit.bbox
-        global selected_signature, selected_kf
+        global selected_signature, selected_signature_anchor, selected_kf
         selected_id = hit.det_id
         selected_name = hit.name
         ax = (x1 + x2) / 2; ay = (y1 + y2) / 2
         selected_anchor_xy = (ax, ay)
-        selected_signature = _hsv_signature_from_bbox(latest_raw, hit.bbox)
+        sig0 = _hsv_signature_from_bbox(latest_raw, hit.bbox)
+        selected_signature = sig0
+        selected_signature_anchor = sig0  # immutable lock-time copy
         selected_kf = TargetKF(ax, ay)
         mode = "auto"
     return jsonify({"ok": True, "selected_id": selected_id,
@@ -2566,13 +2860,15 @@ def api_select_detection():
             tilt_deg = actual_tilt_deg
         jog_pan_target = None
         jog_tilt_target = None
-        global selected_signature, selected_kf
+        global selected_signature, selected_signature_anchor, selected_kf
         selected_id = hit.det_id
         selected_name = hit.name
         x1, y1, x2, y2 = hit.bbox
         ax = (x1 + x2) / 2; ay = (y1 + y2) / 2
         selected_anchor_xy = (ax, ay)
-        selected_signature = _hsv_signature_from_bbox(latest_raw, hit.bbox)
+        sig0 = _hsv_signature_from_bbox(latest_raw, hit.bbox)
+        selected_signature = sig0
+        selected_signature_anchor = sig0
         selected_kf = TargetKF(ax, ay)
         mode = "auto"
     return jsonify({"ok": True, "selected_id": selected_id,
@@ -2621,10 +2917,13 @@ def api_gains():
     data = request.get_json(force=True, silent=True) or {}
     with lock:
         if data.get("reset"):
-            pan_gains.kp = 0.50; pan_gains.ki = 0.18; pan_gains.kd = 0.14
-            pan_gains.max_rate_deg_s = 35.0; pan_gains.deadband_norm = 0.008
-            tilt_gains.kp = 0.50; tilt_gains.ki = 0.18; tilt_gains.kd = 0.14
-            tilt_gains.max_rate_deg_s = 26.0; tilt_gains.deadband_norm = 0.012
+            # Higher max_rate so the nose can keep up with the chassis (V
+            # drive) and bus motion; tilt gets a separate cap because the
+            # joint is bandwidth-limited.
+            pan_gains.kp = 0.65; pan_gains.ki = 0.20; pan_gains.kd = 0.15
+            pan_gains.max_rate_deg_s = 60.0; pan_gains.deadband_norm = 0.008
+            tilt_gains.kp = 0.60; tilt_gains.ki = 0.18; tilt_gains.kd = 0.15
+            tilt_gains.max_rate_deg_s = 45.0; tilt_gains.deadband_norm = 0.012
             reset_controller_state()
             return jsonify({"ok": True, "reset": True})
         for key in ("kp", "ki", "kd"):
@@ -2877,6 +3176,78 @@ def api_moving_target():
     if "enabled" in data:
         target_moving = bool(data["enabled"])
     return jsonify({"ok": True, "moving": target_moving})
+
+
+@app.post("/api/bus_moving")
+def api_bus_moving():
+    global bus_moving
+    data = request.get_json(force=True, silent=True) or {}
+    if "enabled" in data:
+        bus_moving = bool(data["enabled"])
+    return jsonify({"ok": True, "bus_moving": bus_moving})
+
+
+@app.post("/api/mantis_moving")
+def api_mantis_moving():
+    global mantis_moving
+    data = request.get_json(force=True, silent=True) or {}
+    if "enabled" in data:
+        mantis_moving = bool(data["enabled"])
+    return jsonify({"ok": True, "mantis_moving": mantis_moving})
+
+
+@app.post("/api/mantis_speed")
+def api_mantis_speed():
+    global mantis_drive_speed
+    data = request.get_json(force=True, silent=True) or {}
+    s = float(data.get("speed", mantis_drive_speed))
+    mantis_drive_speed = max(0.5, min(MANTIS_DRIVE_MAX_SPEED, s))
+    return jsonify({"ok": True, "speed": mantis_drive_speed})
+
+
+@app.post("/api/mantis_drive")
+def api_mantis_drive():
+    """V-key drive. Accepts velocity setpoints (preferred) or one-shot
+    deltas:
+       {"vx": 4.0, "vy": 0, "vyaw": 0}   # smooth car-like drive at 4 m/s
+       {"vx": 0,   "vy": 0, "vyaw": 0}   # stop
+       {"reset": true}                   # snap back to spawn (0,-8)
+    Velocities are in BODY frame: vx = forward, vy = strafe-left.
+    Disables the auto-sway oscillation so user input wins."""
+    global mantis_chassis_x, mantis_chassis_y, mantis_chassis_yaw
+    global mantis_drive_vx, mantis_drive_vy, mantis_drive_vyaw, mantis_moving
+    data = request.get_json(force=True, silent=True) or {}
+    if data.get("reset"):
+        import math as _m, subprocess as _sp
+        mantis_chassis_x, mantis_chassis_y, mantis_chassis_yaw = 0.0, -8.0, 0.0
+        mantis_drive_vx = mantis_drive_vy = mantis_drive_vyaw = 0.0
+        req = ('name: "mantis_robot" '
+               'position { x: 0.0 y: -8.0 z: 0.0 } '
+               'orientation { w: 1.0 }')
+        try:
+            _sp.run(
+                ["gz", "service", "-s", "/world/mantis_robot_world/set_pose",
+                 "--reqtype", "gz.msgs.Pose", "--reptype", "gz.msgs.Boolean",
+                 "--timeout", "300", "--req", req],
+                capture_output=True, timeout=1.0, check=False,
+            )
+        except Exception:
+            pass
+    if "vx" in data:
+        mantis_drive_vx = clamp(float(data["vx"]),
+                                -MANTIS_DRIVE_MAX_SPEED, MANTIS_DRIVE_MAX_SPEED)
+    if "vy" in data:
+        mantis_drive_vy = clamp(float(data["vy"]),
+                                -MANTIS_DRIVE_MAX_SPEED, MANTIS_DRIVE_MAX_SPEED)
+    if "vyaw" in data:
+        mantis_drive_vyaw = clamp(float(data["vyaw"]),
+                                  -MANTIS_DRIVE_MAX_YAW, MANTIS_DRIVE_MAX_YAW)
+    mantis_moving = False  # manual drive overrides auto sway
+    return jsonify({"ok": True,
+                    "x": mantis_chassis_x, "y": mantis_chassis_y,
+                    "yaw": mantis_chassis_yaw,
+                    "vx": mantis_drive_vx, "vy": mantis_drive_vy,
+                    "vyaw": mantis_drive_vyaw})
 
 
 @app.post("/api/cars_moving")
