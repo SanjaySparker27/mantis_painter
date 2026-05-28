@@ -183,6 +183,59 @@ def run_scenario(name, n_trials, duration_s, *, bus=False, mantis=False,
     return results
 
 
+def run_random_scenario(name, n_trials, duration_s, *, bus=False):
+    """Random ego setpoints (vx, vy, vyaw all random) every 1-3s — stress
+    tests the nose-tracking under unpredictable chassis motion."""
+    import random
+    print(f"\n=== {name} — {n_trials} trials × {duration_s}s ===")
+    results = []
+    for i in range(n_trials):
+        reset(bus=bus)
+        hit = lock_largest()
+        if not hit:
+            print(f"  trial {i+1}: NO DETECTION (skip)")
+            results.append({"pass": False, "real_pct": 0.0,
+                            "trans": 0, "ex_max": None, "ey_max": None})
+            continue
+        if bus:
+            P("/api/bus_moving", {"enabled": True})
+        samples_ts = []
+        transitions = 0
+        last_sel = None
+        t0 = time.time()
+        next_switch = t0
+        rng = random.Random(i * 13 + 7)
+        while time.time() - t0 < duration_s:
+            if time.time() >= next_switch:
+                vx = rng.uniform(-8.0, 8.0)
+                vy = 0.0  # body-y not in chassis model
+                vyaw = rng.uniform(-0.3, 0.3)
+                P("/api/mantis_drive", {"vx": vx, "vy": vy, "vyaw": vyaw})
+                next_switch = time.time() + rng.uniform(1.0, 3.0)
+            d = G("/api/status")
+            sel = d["selected_id"]
+            locked = next((x for x in d["detections"] if x["id"] == sel), None)
+            if locked:
+                cx = (locked["bbox"][0] + locked["bbox"][2]) / 2
+                cy = (locked["bbox"][1] + locked["bbox"][3]) / 2
+                samples_ts.append((time.time() - t0, cx, cy))
+            if sel != last_sel:
+                transitions += 1
+                last_sel = sel
+            time.sleep(0.1)
+        P("/api/mantis_drive", {"vx": 0, "vy": 0, "vyaw": 0})
+        m = trial_metrics(samples_ts, transitions, duration_s)
+        results.append(m)
+        tag = "PASS" if m["pass"] else "FAIL"
+        if m["ex_max"] is not None:
+            print(f"  trial {i+1}: {tag}  real={m['real_pct']*100:.0f}% "
+                  f"trans={m['trans']} ex_max={m['ex_max']:.2f} "
+                  f"ey_max={m['ey_max']:.2f}")
+    pct_pass = sum(1 for r in results if r["pass"]) / len(results) * 100
+    print(f"  -> PASS {pct_pass:.0f}%")
+    return results
+
+
 def main():
     print(f"REDUNDANCY BENCH @ {time.strftime('%H:%M:%S')}")
     summary = {}
@@ -198,6 +251,9 @@ def main():
     summary["bus_ego_yaw"] = run_scenario(
         "S6 bus + ego 6 m/s + yaw 0.3", 5, 12,
         bus=True, drive_vx=6.0, drive_vyaw=0.3)
+    summary["random_ego"] = run_random_scenario("S7 random ego motion", 5, 15)
+    summary["random_ego_bus"] = run_random_scenario(
+        "S8 random ego + bus moving", 5, 15, bus=True)
 
     print("\n\n=== AGGREGATE ===")
     for name, results in summary.items():

@@ -775,17 +775,11 @@ def _confirm_new_id(cand: "Detection") -> "Detection | None":
     if sweep_enabled and sweep_center_hold_start_ts > 0:
         g = _ghost_target()
         return g if g is not None else cand
-    # Ego-motion lock-down: while the chassis is driving or auto-swaying,
-    # target bearing changes faster than the Kalman process noise can
-    # explain, so Pass 1/2/3 are more likely to bind onto a sibling that
-    # happens to fall near the predicted bbox. Hold the original lock by
-    # returning ghost instead of rebinding to a new det_id.
-    if (mantis_moving
-        or abs(mantis_drive_vx) > 0.1
-        or abs(mantis_drive_vy) > 0.1
-        or abs(mantis_drive_vyaw) > 0.05):
-        g = _ghost_target()
-        return g if g is not None else cand
+    # NOTE: an earlier "ego lock-down" used to short-circuit to ghost while
+    # the chassis was moving. That made pan/tilt blind to the re-emerging
+    # bbox after a brief YOLO id drop — visible as "lost the lock while I
+    # was driving." Removed. The signature + IoU + hysteresis gates above
+    # already keep Pass 1/2/3 from rebinding to a sibling.
     # Count any frame where the resolver wants to rebind, even if YOLO is
     # thrashing the det_id between frames. Without this, hysteresis never
     # confirms when ByteTrack assigns a new id each frame (e.g. after a
@@ -943,10 +937,22 @@ def resolve_selected_target() -> Detection | None:
                 iou_ok = True
                 if pred_bbox is not None:
                     iou_ok = _bbox_iou(pred_bbox, cand.bbox) >= PASS1_IOU_MIN
+                # Wider Kalman + IoU gates while ego is moving — KF
+                # process noise can't account for chassis-induced bearing
+                # shift, so the prediction drifts away from the real
+                # target. Loosen so the re-bind succeeds instead of
+                # rejecting on a spurious Maha distance.
+                ego_kicked = (mantis_moving
+                              or abs(mantis_drive_vx) > 0.1
+                              or abs(mantis_drive_vy) > 0.1
+                              or abs(mantis_drive_vyaw) > 0.05)
+                maha_gate = KF_MAHA_GATE * (4.0 if ego_kicked else 1.0)
+                if ego_kicked:
+                    iou_ok = True  # rely on signature gate alone
                 # Accept only if signature is tight, Kalman gate passes,
                 # candidate is a clear winner, and overlaps the predicted
                 # footprint.
-                if (sig_d < PASS1_SIG_MAX and m <= KF_MAHA_GATE
+                if (sig_d < PASS1_SIG_MAX and m <= maha_gate
                         and gap_ok and iou_ok):
                     # Pass 1 winner passed every gate, treat as high-
                     # confidence so the signature can blend toward this
