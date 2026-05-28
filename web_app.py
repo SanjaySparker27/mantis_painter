@@ -1361,17 +1361,20 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
                   or abs(mantis_drive_vy) > 0.1
                   or abs(mantis_drive_vyaw) > 0.05)
     ego_boost = 2.6 if ego_active else 1.0
+    # More damping during ego motion. Kp boost without Kd boost was
+    # causing the nose to overshoot the target during direction reversals.
+    kd_boost = 2.0 if ego_active else 1.0
     PID_OUT_CLAMP_DEG = 18.0 if ego_active else 6.0
     pan_u_deg = clamp(
         ego_boost * pan_gains.kp * pan_err_deg
         + pan_gains.ki * pan_i_deg
-        + pan_gains.kd * pan_derr_per_s,
+        + kd_boost * pan_gains.kd * pan_derr_per_s,
         -PID_OUT_CLAMP_DEG, PID_OUT_CLAMP_DEG,
     )
     tilt_u_deg = clamp(
         ego_boost * tilt_gains.kp * tilt_err_deg
         + tilt_gains.ki * tilt_i_deg
-        + tilt_gains.kd * tilt_derr_per_s,
+        + kd_boost * tilt_gains.kd * tilt_derr_per_s,
         -PID_OUT_CLAMP_DEG, PID_OUT_CLAMP_DEG,
     )
 
@@ -1450,6 +1453,28 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
         tilt_deg = clamp(tilt_deg + lpf * tilt_step_raw,
                          TILT_LIMIT[0], TILT_LIMIT[1])
     publish_pan_tilt()
+
+    # Auto chassis-yaw follow: when pan saturates while ACTIVELY tracking
+    # a locked target (recent real detection), rotate the chassis so the
+    # nose can return toward neutral. Sign: pan_deg < 0 -> rotate chassis
+    # in same world direction as the target. Adds to user V-drive yaw so
+    # the operator can still override.
+    global mantis_auto_yaw_rate
+    target_fresh = (selected_id is not None
+                    and last_target_seen_ts > 0
+                    and (now - last_target_seen_ts) < 0.6)
+    if target_fresh:
+        pan_abs = abs(pan_deg)
+        if pan_abs > PAN_FOLLOW_THRESHOLD_DEG:
+            span = max(1.0, PAN_LIMIT[1] - PAN_FOLLOW_THRESHOLD_DEG)
+            overshoot = clamp((pan_abs - PAN_FOLLOW_THRESHOLD_DEG) / span,
+                              0.0, 1.0)
+            mantis_auto_yaw_rate = -math.copysign(
+                PAN_FOLLOW_GAIN * overshoot, pan_deg)
+        else:
+            mantis_auto_yaw_rate *= 0.7
+    else:
+        mantis_auto_yaw_rate *= 0.7  # decay when target lost
 
     if abs(nx) < pan_gains.deadband_norm and abs(ny) < tilt_gains.deadband_norm:
         centered_frames += 1
@@ -1800,6 +1825,12 @@ mantis_drive_vyaw: float = 0.0
 MANTIS_DRIVE_MAX_SPEED = 25.0  # m/s clamp (high-speed mode caps)
 MANTIS_DRIVE_MAX_YAW = 3.0     # rad/s clamp
 mantis_drive_speed: float = 4.0  # active speed setpoint used by V-key drive
+# Auto chassis-yaw: rotate the whole vehicle when the pan joint runs out
+# of travel, so the nose can return toward neutral and keep tracking the
+# locked target. Active whenever a target is locked.
+mantis_auto_yaw_rate: float = 0.0
+PAN_FOLLOW_THRESHOLD_DEG = 55.0   # start yawing the chassis past this pan
+PAN_FOLLOW_GAIN = 2.5             # rad/s at full pan saturation
 BUS_SPEED_M_S = 12.0      # peak depth velocity (front-back from mantis perspective)
 BUS_PERIOD_S = 2.0        # full forward+reverse cycle
 
@@ -1881,21 +1912,24 @@ threading.Thread(target=_mantis_motion_loop, daemon=True).start()
 def _mantis_drive_loop():
     """30 Hz integrator that turns velocity setpoints into smooth chassis
     motion. JS keydown writes mantis_drive_v*; keyup zeros them; this loop
-    advances pose and teleports via gz set_pose. Gives car-like continuous
-    motion instead of per-keypress jumps."""
+    advances pose and teleports via gz set_pose. Also adds the
+    auto-chassis-yaw rate so the vehicle follows the target when pan
+    saturates."""
     import math as _m, subprocess as _sp
     global mantis_chassis_x, mantis_chassis_y, mantis_chassis_yaw
     dt = 1.0 / 30.0
     while True:
+        # Combine explicit V-drive yaw with auto chassis follow yaw.
+        eff_vyaw = mantis_drive_vyaw + mantis_auto_yaw_rate
         if abs(mantis_drive_vx) > 1e-3 or abs(mantis_drive_vy) > 1e-3 \
-                or abs(mantis_drive_vyaw) > 1e-3:
+                or abs(eff_vyaw) > 1e-3:
             # vx is FORWARD (body x), vy is LEFT (body y). Rotate into world.
             yaw = mantis_chassis_yaw
             wx = mantis_drive_vx * _m.cos(yaw) - mantis_drive_vy * _m.sin(yaw)
             wy = mantis_drive_vx * _m.sin(yaw) + mantis_drive_vy * _m.cos(yaw)
             mantis_chassis_x += wx * dt
             mantis_chassis_y += wy * dt
-            mantis_chassis_yaw += mantis_drive_vyaw * dt
+            mantis_chassis_yaw += eff_vyaw * dt
             req = (f'name: "mantis_robot" '
                    f'position {{ x: {mantis_chassis_x:.3f} y: {mantis_chassis_y:.3f} z: 0.0 }} '
                    f'orientation {{ z: {_m.sin(mantis_chassis_yaw/2):.4f} '
