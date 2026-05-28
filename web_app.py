@@ -1431,7 +1431,11 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
 
     # Inside deadband: freeze command at actual joint position and decay
     # integral fast so we don't accumulate noise into the next motion.
-    if in_deadband_x:
+    # EXCEPTION: during ego motion the deadband branch was pulling pan_cmd
+    # back toward actual_pan, which fought the yaw feed-forward and
+    # throttled compensation to ~10 deg/s instead of the needed ~57 deg/s.
+    # Skip the actual-pan blend during ego so the FF runs at full rate.
+    if in_deadband_x and not ego_active:
         pan_deg = clamp(0.85 * pan_deg + 0.15 * actual_pan + yaw_ff_deg,
                         PAN_LIMIT[0], PAN_LIMIT[1])
         pan_i_deg *= 0.80
