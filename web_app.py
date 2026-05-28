@@ -1281,29 +1281,34 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
         cx = cx + target_vx_pix_s * stale
         cy = cy + target_vy_pix_s * stale
 
-    if last_target_seen_ts > 0:
+    # Velocity is computed across REAL detections only. Updating
+    # last_target_cx every tick (including ghost frames) made raw_vx=0
+    # between detections, so target_vx_pix_s decayed to ~0 before the
+    # next YOLO update arrived. Now we freeze last_target_cx until a
+    # fresh detection comes in.
+    if last_target_seen_ts > 0 and target.score > 0:
         gap = max(1e-3, now - last_target_seen_ts)
         if gap < 0.5:
             raw_vx = (cx - last_target_cx) / gap
             raw_vy = (cy - last_target_cy) / gap
-            alpha = 0.25
+            alpha = 0.35
             target_vx_pix_s = (1 - alpha) * target_vx_pix_s + alpha * raw_vx
             target_vy_pix_s = (1 - alpha) * target_vy_pix_s + alpha * raw_vy
         else:
             target_vx_pix_s = 0.0
             target_vy_pix_s = 0.0
-    last_target_cx = cx
-    last_target_cy = cy
-    # Only treat REAL detections as 'seen'. Ghost targets must NOT refresh
-    # this stamp or the persistence horizon never expires and the loop
-    # keeps fabricating ghosts forever.
     if target.score > 0:
+        last_target_cx = cx
+        last_target_cy = cy
         last_target_seen_ts = now
 
     # Dead-zone on velocity so detector jitter doesn't drive feedforward.
-    vx_eff = target_vx_pix_s if abs(target_vx_pix_s) > 25.0 else 0.0
-    vy_eff = target_vy_pix_s if abs(target_vy_pix_s) > 20.0 else 0.0
-    lead_s = 0.06
+    # Lowered from 25/20 to 8/6 px/s — at 30 m range a target moving at
+    # walking speed (1 m/s lateral) generates ~22 px/s, well above 8.
+    vx_eff = target_vx_pix_s if abs(target_vx_pix_s) > 8.0 else 0.0
+    vy_eff = target_vy_pix_s if abs(target_vy_pix_s) > 6.0 else 0.0
+    # Bigger lead: PID latency + detection latency ~120-150 ms together.
+    lead_s = 0.12
     cx_lead = cx + vx_eff * lead_s
     cy_lead = cy + vy_eff * lead_s
 
@@ -1786,8 +1791,8 @@ mantis_drive_vyaw: float = 0.0
 MANTIS_DRIVE_MAX_SPEED = 25.0  # m/s clamp (high-speed mode caps)
 MANTIS_DRIVE_MAX_YAW = 3.0     # rad/s clamp
 mantis_drive_speed: float = 4.0  # active speed setpoint used by V-key drive
-BUS_SPEED_M_S = 4.0       # peak depth velocity (front-back from mantis perspective)
-BUS_PERIOD_S = 3.0        # full forward+reverse cycle
+BUS_SPEED_M_S = 12.0      # peak depth velocity (front-back from mantis perspective)
+BUS_PERIOD_S = 2.0        # full forward+reverse cycle
 
 
 def _bus_loop():
