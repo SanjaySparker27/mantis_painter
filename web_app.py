@@ -1360,9 +1360,11 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
                   or abs(mantis_drive_vx) > 0.1
                   or abs(mantis_drive_vy) > 0.1
                   or abs(mantis_drive_vyaw) > 0.05)
-    ego_boost = 2.6 if ego_active else 1.0
-    # More damping during ego motion. Kp boost without Kd boost was
-    # causing the nose to overshoot the target during direction reversals.
+    # Yaw feed-forward already compensates for chassis rotation. Boosting
+    # Kp further made PID + FF compound and overshoot. Pull Kp boost back
+    # to 1.4x — just enough headroom for residual bbox correction without
+    # fighting the FF. Kd stays high for damping.
+    ego_boost = 1.4 if ego_active else 1.0
     kd_boost = 2.0 if ego_active else 1.0
     PID_OUT_CLAMP_DEG = 18.0 if ego_active else 6.0
     pan_u_deg = clamp(
@@ -1424,6 +1426,13 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     tilt_max_step = tilt_gains.max_rate_deg_s * dt * zoom_scale * rate_boost
     pan_step_raw = clamp(desired_pan - pan_deg, -pan_max_step, pan_max_step)
     tilt_step_raw = clamp(desired_tilt - tilt_deg, -tilt_max_step, tilt_max_step)
+    # When the target is a ghost (lock-down or detection gap), pan_u_deg = 0
+    # so desired_pan = actual_pan. Stepping toward actual pulls pan_cmd
+    # back, fighting the yaw feed-forward. Zero the step in that case so
+    # only yaw_ff drives the command.
+    if target is not None and target.score == 0 and ego_active:
+        pan_step_raw = 0.0
+        tilt_step_raw = 0.0
     base_lpf = 0.32 / max(1.0, math.sqrt(zoom_factor))
     lpf = min(0.7, base_lpf * 1.8) if ego_active else base_lpf
     # Yaw feed-forward applied DIRECTLY to pan_deg, bypassing the LPF so
@@ -1463,18 +1472,24 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     target_fresh = (selected_id is not None
                     and last_target_seen_ts > 0
                     and (now - last_target_seen_ts) < 0.6)
-    if target_fresh:
+    # Only auto-yaw when the user isn't actively steering. Otherwise
+    # auto_yaw fights the user's V-drive input which is confusing.
+    user_yawing = abs(mantis_drive_vyaw) > 0.05
+    if target_fresh and not user_yawing:
         pan_abs = abs(pan_deg)
         if pan_abs > PAN_FOLLOW_THRESHOLD_DEG:
             span = max(1.0, PAN_LIMIT[1] - PAN_FOLLOW_THRESHOLD_DEG)
             overshoot = clamp((pan_abs - PAN_FOLLOW_THRESHOLD_DEG) / span,
                               0.0, 1.0)
-            mantis_auto_yaw_rate = -math.copysign(
+            # PAN_SIGN = -1 so pan_deg < 0 means camera is looking RIGHT of
+            # the chassis nose. Chassis must yaw in the SAME direction as
+            # pan_deg to bring its nose around to where the camera points.
+            mantis_auto_yaw_rate = math.copysign(
                 PAN_FOLLOW_GAIN * overshoot, pan_deg)
         else:
             mantis_auto_yaw_rate *= 0.7
     else:
-        mantis_auto_yaw_rate *= 0.7  # decay when target lost
+        mantis_auto_yaw_rate *= 0.7  # decay when user is steering or no target
 
     if abs(nx) < pan_gains.deadband_norm and abs(ny) < tilt_gains.deadband_norm:
         centered_frames += 1
@@ -1910,15 +1925,19 @@ threading.Thread(target=_mantis_motion_loop, daemon=True).start()
 
 
 def _mantis_drive_loop():
-    """30 Hz integrator that turns velocity setpoints into smooth chassis
-    motion. JS keydown writes mantis_drive_v*; keyup zeros them; this loop
-    advances pose and teleports via gz set_pose. Also adds the
-    auto-chassis-yaw rate so the vehicle follows the target when pan
-    saturates."""
+    """Integrator that turns velocity setpoints into smooth chassis motion.
+    Uses WALL-CLOCK dt so that subprocess overhead in set_pose doesn't
+    cause the chassis to yaw/translate slower than the commanded rate.
+    Without this the loop ran at ~10 Hz but integrated as if 30 Hz so
+    chassis motion was ~3x slower than requested."""
     import math as _m, subprocess as _sp
     global mantis_chassis_x, mantis_chassis_y, mantis_chassis_yaw
-    dt = 1.0 / 30.0
+    target_period = 1.0 / 30.0
+    last_t = time.time()
     while True:
+        now_t = time.time()
+        dt = min(0.2, now_t - last_t)   # clamp pathological gaps
+        last_t = now_t
         # Combine explicit V-drive yaw with auto chassis follow yaw.
         eff_vyaw = mantis_drive_vyaw + mantis_auto_yaw_rate
         if abs(mantis_drive_vx) > 1e-3 or abs(mantis_drive_vy) > 1e-3 \
@@ -1943,7 +1962,12 @@ def _mantis_drive_loop():
                 )
             except Exception:
                 pass
-        time.sleep(dt)
+        # Sleep only the remainder of the target period; if subprocess took
+        # longer than 33 ms we skip sleep entirely and the next iter uses
+        # the larger wall-clock dt above.
+        slept = time.time() - now_t
+        if slept < target_period:
+            time.sleep(target_period - slept)
 
 
 threading.Thread(target=_mantis_drive_loop, daemon=True).start()
