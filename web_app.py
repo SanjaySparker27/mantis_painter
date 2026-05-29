@@ -1512,7 +1512,13 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     # lpf * max_rate (~32 deg/s).
     using_world_override = (target is not None and target.score == 0
                             and target_world_pan_deg is not None)
-    if in_deadband_x and not using_world_override:
+    # Also skip the actual-pan deadband blend when the chassis is moving
+    # (any user vyaw OR auto-yaw active). The 0.15*actual_pan blend was
+    # decaying ~5% of the velocity-feedforward contribution each frame,
+    # so pan never quite kept up with chassis rotation.
+    chassis_rotating = (abs(mantis_drive_vyaw) > 0.05
+                        or abs(mantis_auto_yaw_rate) > 0.05)
+    if in_deadband_x and not using_world_override and not chassis_rotating:
         pan_deg = clamp(0.85 * pan_deg + 0.15 * actual_pan,
                         PAN_LIMIT[0], PAN_LIMIT[1])
         pan_i_deg *= 0.80
@@ -1540,8 +1546,15 @@ def auto_control_step(width: int, height: int, dt: float) -> None:
     # limit.
     global _yaw_ff_lpf_vyaw
     target_eff_vyaw = mantis_drive_vyaw + mantis_auto_yaw_rate
-    alpha_vff = 0.30  # ~3-frame time constant at 30 fps
-    _yaw_ff_lpf_vyaw = (1 - alpha_vff) * _yaw_ff_lpf_vyaw + alpha_vff * target_eff_vyaw
+    # Only smooth when the sign is FLIPPING (or stepping from 0). For
+    # sustained or zero-input cases follow target_eff_vyaw directly so
+    # vFF doesn't lag behind the actual chassis rate.
+    if (_yaw_ff_lpf_vyaw == 0.0 or target_eff_vyaw == 0.0
+            or (_yaw_ff_lpf_vyaw * target_eff_vyaw) > 0.0):
+        _yaw_ff_lpf_vyaw = target_eff_vyaw
+    else:
+        # Sign flip — smooth across 4 ticks.
+        _yaw_ff_lpf_vyaw = 0.75 * _yaw_ff_lpf_vyaw + 0.25 * target_eff_vyaw
     YAW_FF_CALIB = 1.0
     yaw_ff_deg = (math.degrees(_yaw_ff_lpf_vyaw)
                   * dt * PAN_SIGN * YAW_FF_CALIB)
